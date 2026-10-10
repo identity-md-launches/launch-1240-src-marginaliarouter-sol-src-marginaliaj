@@ -1,0 +1,22 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MarginaliaRouter",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaJudge",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaTreasury",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaPricer",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "Ethereum mainnet deployment of the four Marginalia companion implementations, each with a parameterless constructor (zero ABI constructor inputs, verified against the compiled artifacts) and no constructor dependency on any other contract, so the order is free and nothing is read from chain at deploy time. MarginaliaRouter, MarginaliaJudge and MarginaliaTreasury are EIP-1167 implementation targets: each constructor writes hook = address(1), so the implementation's one-shot init reverts AlreadyInitialised forever and only a zero-storage clone can be initialised, once, by the cloning hook (init requires msg.sender == hook_). The later univ4_hook launch (MarginaliaHook) clones all three in its constructor and calls Router.init(poolManager, hook), Judge.init(hook, intake, action, signer) and Treasury.init(hook). MarginaliaPricer has no constructor and no storage; the hook and router use it by staticcall. No owner, pause, upgrade, proxy or selfdestruct anywhere; every function is callable by anyone except init. Router: posts notes by swapping IMD for MARG with hookData and may trade the noted token in the same transaction on canonical Uniswap v4, v3 (factory 0x1F98431c8aD98523631AE4a59f267346ea31F984) or v2 (factory 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f); the note must be about the token traded, callbacks are restricted to the manager and the pending v3 pool, pulls are measured by balance delta (fee-on-transfer safe) and sells are full-fill with a caller slippage floor; it only pulls from msg.sender. Judge: IdentityMD oracle consumer (EIP-712 domain 'IdentityMD Oracle' v2) that, once the hook's week is over and the thesis pot holds at least JUDGE_THRESHOLD = 2 IMD, buys the 7-panel, quorum-5 ranking of the week's theses through the Intake 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56 at the hook's JUDGE_PRICE = 0.5 IMD (never above MAX_PRICE = 1 IMD), may re-request after a 3-day unanswered deadline, and tells the hook whom to pay; prizes split 50/30/20 to the ranked three. Treasury: holds IMD and lets anyone drip DRIP_BPS = 200 (2%) of its balance once per UTC day into the hook's pot; no withdraw, refuses ETH. Pricer: score arithmetic plus the settlement rule that resolves the launch-1217 finding. v3 and v2 venues settle on the TWAP of the on-chain accumulator between the first and last observation; v4 venues and the ETH->IMD hub leg (pool id 0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3) settle on the observation least favourable to the call (minimum for BUY, maximum for SELL). Post prices need a checkpoint aged POST_MIN_SPAN = 1 hour and under 6 hours, so a two-block pump-observe-unwind moves neither rule. Assumes 18-decimal assets. The 0.25% action fee is not in this version. Runtime addresses are fixed by the later hook launch: Uniswap v4 PoolManager 0x000000000004444c5dc75cb358380d2e3de08a90, IMD 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7. This launch deploys no token or pool, sends no ETH and makes no initialisation call."
+}
