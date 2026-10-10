@@ -126,7 +126,9 @@ $('pay').onclick = async () => {
     const req = ch.accepts[0];
     step(`challenge: pay ${formatEther(BigInt(req.amount))} IMD to ${req.payTo} on ${req.network}`, 'done');
     // 3. Permit2 payment (signature 1)
-    const client = x402Client.fromConfig({ schemes: [{ network: req.network, client: new ExactEvmScheme(wallet) }] });
+    // IMD is not a "default asset" for the x402 client's spend controls. The asset and the exact amount are
+    // already pinned by the quote the wallet signs in the second signature, so the library guard adds nothing here.
+    const client = x402Client.fromConfig({ schemes: [{ network: req.network, client: new ExactEvmScheme(wallet) }], spendControls: false });
     const { extensions, ...generated } = await client.createPaymentPayload({ x402Version: 2, resource: ch.resource, accepts: [req] });
     const payment = JSON.parse(JSON.stringify({ ...generated, accepted: req }));
     step('Permit2 payment signed', 'done');
