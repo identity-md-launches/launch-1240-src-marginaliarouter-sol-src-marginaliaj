@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Vm} from "forge-std/Vm.sol";
 import {Test} from "forge-std/Test.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -21,6 +22,7 @@ import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
 import {MarginaliaTreasury} from "../../src/MarginaliaTreasury.sol";
 import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
 import {MarginaliaMath} from "../../src/MarginaliaMath.sol";
+import {MarginaliaPricer} from "../../src/MarginaliaPricer.sol";
 
 /// @notice The rehearsal: the real IMD LaunchFactory on a mainnet fork, impersonating its launch wallet,
 /// deploys Marginalia exactly as a protocol launch would, then a user posts a note through the router.
@@ -80,6 +82,7 @@ contract MainnetLaunchTest is Test {
         vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
         vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
         vm.etch(MarginaliaImpls.MATH, address(new MarginaliaMath()).code);
+        vm.etch(MarginaliaImpls.PRICER, address(new MarginaliaPricer()).code);
         bytes memory tokenCode = type(Marginalia).creationCode;
         address predictedToken = FACTORY.predictToken(LAUNCH_NUMBER, tokenCode);
         bytes memory hookCode =
@@ -182,12 +185,12 @@ contract MainnetLaunchTest is Test {
         vm.startPrank(alice);
         IERC20(IMD).approve(address(router), type(uint256).max);
         PoolKey memory hub = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
-        assertEq(PoolId.unwrap(hub.toId()), hook.HUB_POOL_ID(), "hub key");
+        assertEq(PoolId.unwrap(hub.toId()), MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), "hub key");
         MarginaliaRouter.XTrade memory x =
             MarginaliaRouter.XTrade(router.X_V4(), hub, false, address(0), IMD, 10 ether, 1); // sell IMD for ETH
         T.NoteParams memory p;
         p.x = IMD;
-        p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
+        p.venue = T.Venue(T.VenueKind.UniV4, MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), address(0), false);
         p.side = T.Side.Sell;
         p.targetBps = 7000;
         p.horizonDays = 14;
@@ -257,6 +260,31 @@ contract MainnetLaunchTest is Test {
         assertGt(n.postPrice, 0);
         emit log_named_uint("LINK price in IMD (1e18)", n.postPrice);
         assertEq(IERC20(WETH).balanceOf(address(router)), 0, "router holds nothing");
+
+        // Settlement on the live v3 accumulator: three observations an hour apart, the TWAP between the first
+        // and the last (the fork's clock moves, its tick does not), the hub leg at its adverse extreme.
+        bytes32 id = bytes32(hook.noteCount());
+        vm.warp(hook.horizonEnd(id));
+        uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
+        for (uint256 i = 0; i < 3; ++i) {
+            hook.observe(id);
+            vm.roll(startBlock + 25 * (i + 1));
+            vm.warp(startTs + 1 hours * (i + 1));
+        }
+        vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
+        vm.recordLogs();
+        hook.settle(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 settlePrice;
+        for (uint256 i = 0; i < logs.length; ++i) {
+            if (logs[i].topics[0] == keccak256("Settled(bytes32,uint8,uint256,int256,address)")) {
+                (, settlePrice,,) = abi.decode(logs[i].data, (uint8, uint256, int256, address));
+            }
+        }
+        assertApproxEqRel(settlePrice, n.postPrice, 0.01e18, "TWAP settle price tracks the unchanged pool");
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Wrong)); // 1.5x did not happen
+        emit log_named_uint("LINK settle price in IMD (1e18)", settlePrice);
     }
 
     /// @dev Buy UNI with WETH on the live Uniswap v2 UNI/WETH pair and post the call in one tx.
@@ -297,7 +325,7 @@ contract MainnetLaunchTest is Test {
         IERC20(IMD).approve(address(router), type(uint256).max);
         T.NoteParams memory p;
         p.x = IMD;
-        p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
+        p.venue = T.Venue(T.VenueKind.UniV4, MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), address(0), false);
         PoolKey memory hubKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
         p.side = T.Side.Buy;
         p.targetBps = 15_000;

@@ -2,7 +2,8 @@
 
 A Uniswap v4 hook launch on the IMD protocol (Ethereum mainnet, paired with IMD). Buying MARG through the
 router with a note attached posts a falsifiable call on any ERC-20, backed by a flat stamp and a flat
-refundable deposit. Calls resolve against on-chain price observations; right calls get their deposit back,
+refundable deposit. Calls resolve against a manipulation-resistant settlement price built from permissionless
+on-chain observations (v3/v2 TWAPs, the adverse extreme on v4); right calls get their deposit back,
 everything else feeds a pot that pays the best-argued notes of the day, ranked by the IMD oracle panel.
 No owner, no pause, no upgrade. Spec: `SPEC.md`.
 
@@ -15,7 +16,8 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
 | `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pools daily. No withdraw; refuses ETH. |
-| `MarginaliaMath` | Stateless score arithmetic (log2, sqrt, median, difficulty) the hook calls by staticcall; kept out of the hook for code size. |
+| `MarginaliaMath` | Stateless score arithmetic (log2, sqrt, difficulty) the hook calls by staticcall; kept out of the hook for code size. |
+| `MarginaliaPricer` | Stateless price reads and the settlement rule: post-time spot; observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. One honest observation pins the extreme, so a pump must be held for the whole ≥1 h span. |
 
 ## How the pot pays
 
@@ -34,8 +36,8 @@ except through the score, which is difficulty-weighted, netted against wrong cal
 
 1. Contracts-only launch: `MarginaliaRouter`, `MarginaliaJudge`, `MarginaliaTreasury` implementations
    (ownerless; they lock themselves in their constructors so only clones can be initialised, once, by the hook)
-   and `MarginaliaMath`.
-2. Set the three addresses in `src/MarginaliaImpls.sol`.
+   plus the stateless `MarginaliaMath` and `MarginaliaPricer`.
+2. Set the five addresses in `src/MarginaliaImpls.sol`.
 3. Hook launch (`launch.json`): the factory deploys the token and the hook; the hook's constructor clones
    the three implementations and initialises each with itself in the same transaction.
 
@@ -76,9 +78,21 @@ unanswered judging request can be retried after three days, quiet weeks' thesis 
 confirms nothing is pending, implementations lock themselves against stray `init` calls, sells of pot MARG
 require a whole fill with a slippage floor, and the Attested class can no longer be self-declared.
 
+The relaunch of those fixes (launch 1217) was then parked by the audit judge on the one finding the first
+round had not closed: `observe()` read spot, so a two-block pump → observe → unwind bought a settlement
+for swap fees. v0.5 moved settlement into `MarginaliaPricer`: Uniswap v3 and v2 venues settle on the
+time-weighted average between the first and last observation (their on-chain accumulators), v4 venues
+and the ETH→IMD hub leg settle on the observation least favourable to the call, and the observations
+must span at least an hour. A pump now has to be held for the whole span against every arbitrageur, and
+any honest observer can pin the price. Tests: `testTwoBlockPumpObserveUnwindSettlesWrong` (local),
+`testTradeAndNoteOnUniswapV3` settles LINK on the live v3 accumulator (fork), `test/Pricer.t.sol`.
+
 ## v1 scope and known limits
 
-- Price adapters assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
+- Price reads assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
+- v4 venues have no on-chain accumulator, so they settle on the adverse extreme rather than a TWAP: a
+  single hostile observation can push a genuine call to WRONG only by moving the pool against it at that
+  block, which costs the mover the same swap fees and arbitrage exposure as a pump.
 - Sells of MARG pay 3% through any router, or 1% plus the stamp through `sellWithNote` with a note and deposit attached.
 - The X trade leg supports v4 pools (including native-ETH pairs), v3 pools and v2 pairs; exact-input only.
 - The implementation addresses in `MarginaliaImpls.sol` are rehearsal placeholders; tests etch code there.

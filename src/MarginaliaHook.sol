@@ -18,7 +18,7 @@ import {Currency} from "v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {MarginaliaTypes as T} from "./MarginaliaTypes.sol";
-import {PriceAdapters} from "./PriceAdapters.sol";
+import {MarginaliaPricer} from "./MarginaliaPricer.sol";
 import {MarginaliaTreasury} from "./MarginaliaTreasury.sol";
 import {MarginaliaRouter} from "./MarginaliaRouter.sol";
 import {MarginaliaJudge} from "./MarginaliaJudge.sol";
@@ -30,7 +30,7 @@ import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 /// @notice A Uniswap v4 hook on the MARG/IMD launch pool. Buying MARG through the router with a note in
 /// hookData posts a falsifiable call on any ERC-20: a flat stamp (0.1 IMD-equivalent, to the pot) and a
 /// flat deposit (0.5 IMD-equivalent of the bought MARG, locked for the horizon). The call resolves against
-/// the median of on-chain price observations; a right, still-held call gets its deposit back; anything
+/// a manipulation-resistant settlement price (MarginaliaPricer); a right, still-held call gets its deposit back; anything
 /// else forfeits it to the pot. The pot pays the best-argued notes of the day, ranked by the IMD oracle
 /// panel, which this contract verifies as the attestation's consumer. No owner, no pause, no upgrade.
 contract MarginaliaHook is IUnlockCallback {
@@ -54,6 +54,8 @@ contract MarginaliaHook is IUnlockCallback {
     uint256 public constant OBS_MIN = 3;
     uint256 public constant OBS_MAX = 16;
     uint256 public constant OBS_GAP_BLOCKS = 20;
+    /// @dev Observations must span at least this long, so no single block (or pair of blocks) sets the price.
+    uint256 public constant OBS_MIN_SPAN = 1 hours;
     uint256 public constant KEEPER_BPS = 200;
     uint256 public constant MAX_DAY_NOTES = 256;
     uint256 public constant JUDGE_THRESHOLD = 2 ether; // IMD, in the week's thesis pot
@@ -70,8 +72,6 @@ contract MarginaliaHook is IUnlockCallback {
     address public constant ORACLE_SIGNER = 0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982;
     bytes32 public constant ACTION = bytes32("oracle.request@oracle-1");
     /// @dev Ethereum mainnet ETH/IMD hub pool (1% fee, tick spacing 200, no hook): native is token0.
-    bytes32 public constant HUB_POOL_ID = 0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3;
-    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
     // ------------------------------------------------------------------ immutables and pool state
 
@@ -152,7 +152,6 @@ contract MarginaliaHook is IUnlockCallback {
     error AlreadyPaid();
     error InvalidUnlock();
     error PotTooSmall();
-    error QuoteNotPriceable();
     error NothingToSweep();
 
     event PoolBound(PoolId indexed poolId, address indexed imd);
@@ -171,7 +170,7 @@ contract MarginaliaHook is IUnlockCallback {
         uint256 xResult,
         string text
     );
-    event Observed(bytes32 indexed id, uint64 blockNumber, uint256 price, uint256 balance);
+    event Observed(bytes32 indexed id, uint64 timestamp, uint256 xRead, uint256 quoteRead, uint256 balance);
     event Settled(bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper);
     event Retracted(bytes32 indexed id, string text);
     event DepositClaimed(bytes32 indexed id, address indexed to, bool asImd, uint256 amount);
@@ -197,6 +196,7 @@ contract MarginaliaHook is IUnlockCallback {
         if (
             MarginaliaImpls.TREASURY_IMPL.code.length == 0 || MarginaliaImpls.ROUTER_IMPL.code.length == 0
                 || MarginaliaImpls.JUDGE_IMPL.code.length == 0 || MarginaliaImpls.MATH.code.length == 0
+                || MarginaliaImpls.PRICER.code.length == 0
         ) revert InvalidUnlock();
         MarginaliaTreasury t = MarginaliaTreasury(payable(Clones.clone(MarginaliaImpls.TREASURY_IMPL)));
         t.init(address(this));
@@ -267,7 +267,7 @@ contract MarginaliaHook is IUnlockCallback {
     /// @dev Current MARG price in IMD from the bound pool, 1e18 scaled.
     function margPriceInImd() public view returns (uint256) {
         (uint160 sqrtP,,,) = poolManager.getSlot0(poolId);
-        return PriceAdapters.fromSqrt(sqrtP, !imdIs0);
+        return _pricer().fromSqrt(sqrtP, !imdIs0);
     }
 
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata data)
@@ -444,17 +444,13 @@ contract MarginaliaHook is IUnlockCallback {
         );
     }
 
-    /// @dev X priced in IMD, 1e18 scaled: the venue's quote price times the quote's IMD price.
+    /// @dev X priced in IMD at post time, 1e18 scaled (spot; settlement uses the pricer's rule, never spot alone).
     function _priceInImd(T.Venue memory v) private view returns (uint256) {
-        uint256 inQuote = PriceAdapters.priceInQuote(poolManager, v);
-        if (v.quote == imd) return inQuote;
-        if (v.quote == address(0) || v.quote == WETH) {
-            if (block.chainid != 1) revert QuoteNotPriceable();
-            (uint160 sqrtP,,,) = poolManager.getSlot0(PoolId.wrap(HUB_POOL_ID));
-            uint256 ethInImd = PriceAdapters.fromSqrt(sqrtP, true);
-            return FullMath.mulDiv(inQuote, ethInImd, 1e18);
-        }
-        revert QuoteNotPriceable();
+        return _pricer().postPrice(poolManager, v, imd);
+    }
+
+    function _pricer() private pure returns (MarginaliaPricer) {
+        return MarginaliaPricer(MarginaliaImpls.PRICER);
     }
 
     function horizonEnd(bytes32 id) public view returns (uint256) {
@@ -462,7 +458,9 @@ contract MarginaliaHook is IUnlockCallback {
         return uint256(n.postedAt) + uint256(n.horizonDays) * 1 days;
     }
 
-    /// @notice Anyone records a price and balance observation inside the settlement window.
+    /// @notice Anyone records an observation inside the settlement window: the venue's accumulator (v3 / v2)
+    /// or spot (v4), the quote leg's spot, and the author's balance. Spaced by blocks and, across the series,
+    /// by at least OBS_MIN_SPAN: one honest observation defeats a pump that is not held for the whole span.
     function observe(bytes32 id) external {
         T.Note storage n = _note(id);
         if (n.status != T.Status.Open) revert NotOpen();
@@ -474,10 +472,10 @@ contract MarginaliaHook is IUnlockCallback {
         if (obs.length > 0 && block.number < obs[obs.length - 1].blockNumber + OBS_GAP_BLOCKS) {
             revert ObservationTooSoon();
         }
-        uint256 price = _priceInImd(n.venue);
+        (uint256 xRead, uint256 quoteRead) = _pricer().observe(poolManager, n.venue, imd);
         uint256 balance = IERC20(n.x).balanceOf(n.author);
-        obs.push(T.Observation(uint64(block.number), uint192(price), balance));
-        emit Observed(id, uint64(block.number), price, balance);
+        obs.push(T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance));
+        emit Observed(id, uint64(block.timestamp), xRead, quoteRead, balance);
     }
 
     /// @notice Anyone settles a note once its window has closed. The keeper earns 2% of a forfeited deposit.
@@ -486,22 +484,20 @@ contract MarginaliaHook is IUnlockCallback {
         if (n.status != T.Status.Open) revert NotOpen();
         uint256 end = horizonEnd(id);
         if (block.timestamp <= end + SETTLE_WINDOW) revert TooEarly();
-        T.Observation[] storage obs = observations[id];
+        T.Observation[] memory obs = observations[id];
         uint256 count = obs.length;
         T.Status outcome;
         uint256 settlePrice;
-        if (count < OBS_MIN) {
+        if (count < OBS_MIN || obs[count - 1].timestamp - obs[0].timestamp < OBS_MIN_SPAN) {
             outcome = T.Status.VoidNoData;
         } else {
             bool held = true;
-            uint256[] memory prices = new uint256[](count);
             for (uint256 i = 0; i < count; ++i) {
-                prices[i] = obs[i].price;
                 if (n.side == T.Side.Buy ? obs[i].balance < n.postBalance : obs[i].balance > n.postBalance) {
                     held = false;
                 }
             }
-            settlePrice = MarginaliaMath(MarginaliaImpls.MATH).median(prices);
+            settlePrice = _pricer().settlePrice(n.venue, n.side == T.Side.Buy, obs);
             if (!held) {
                 outcome = T.Status.VoidSold;
             } else if (n.side == T.Side.Buy) {

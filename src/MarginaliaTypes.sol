@@ -57,9 +57,13 @@ library MarginaliaTypes {
         string text;
     }
 
+    /// @dev One settlement-window reading: the venue's accumulator (v3 / v2) or spot (v4) for X in its quote,
+    /// the quote leg's spot in IMD, and the author's X balance. The pricer turns a series into one price.
     struct Observation {
+        uint64 timestamp;
         uint64 blockNumber;
-        uint192 price;
+        uint256 xRead;
+        uint256 quoteRead;
         uint256 balance;
     }
 

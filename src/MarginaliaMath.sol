@@ -22,23 +22,6 @@ contract MarginaliaMath {
         return FullMath.mulDiv(l2, s, 1e4) * tier;
     }
 
-    /// @notice The median of an unsorted list (lower-middle averaged for even counts).
-    function median(uint256[] calldata input) external pure returns (uint256) {
-        uint256 n = input.length;
-        uint256[] memory a = new uint256[](n);
-        for (uint256 i = 0; i < n; ++i) a[i] = input[i];
-        for (uint256 i = 1; i < n; ++i) {
-            uint256 v = a[i];
-            uint256 j = i;
-            while (j > 0 && a[j - 1] > v) {
-                a[j] = a[j - 1];
-                --j;
-            }
-            a[j] = v;
-        }
-        return n % 2 == 1 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
-    }
-
     /// @dev log2 of a ratio given ×1e4 (ratio ≥ 1e4), returned ×1e4 with 1/16 precision.
     function log2x1e4(uint256 r) public pure returns (uint256 result) {
         uint256 n;

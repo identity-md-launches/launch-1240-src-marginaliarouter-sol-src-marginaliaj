@@ -11,4 +11,6 @@ library MarginaliaImpls {
     address internal constant TREASURY_IMPL = 0x00000000000000000000000000000000000A0003;
     /// @dev Stateless score arithmetic (no clone needed: it holds nothing).
     address internal constant MATH = 0x00000000000000000000000000000000000a0004;
+    /// @dev Stateless price reads and the settlement rule (no clone needed: it holds nothing).
+    address internal constant PRICER = 0x00000000000000000000000000000000000a0005;
 }

@@ -125,9 +125,11 @@ contract LifecycleTest is Fixture {
         assertGt(hook.margPriceInImd(), 1.1e18);
         vm.warp(hook.horizonEnd(id));
         uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
         for (uint256 i = 0; i < 3; ++i) {
             hook.observe(id);
             vm.roll(startBlock + 25 * (i + 1));
+            vm.warp(startTs + 30 minutes * (i + 1));
         }
         vm.expectRevert(MarginaliaHook.TooEarly.selector);
         hook.settle(id);
@@ -151,9 +153,11 @@ contract LifecycleTest is Fixture {
         uint256 deposit = hook.noteOf(id).deposit;
         vm.warp(hook.horizonEnd(id));
         uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
         for (uint256 i = 0; i < 3; ++i) {
             hook.observe(id);
             vm.roll(startBlock + 25 * (i + 1));
+            vm.warp(startTs + 30 minutes * (i + 1));
         }
         vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
         vm.prank(carol);
@@ -173,9 +177,11 @@ contract LifecycleTest is Fixture {
         _sell(alice, token.balanceOf(alice) / 2);
         vm.warp(hook.horizonEnd(id));
         uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
         for (uint256 i = 0; i < 3; ++i) {
             hook.observe(id);
             vm.roll(startBlock + 25 * (i + 1));
+            vm.warp(startTs + 30 minutes * (i + 1));
         }
         vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
         hook.settle(id);
@@ -313,10 +319,12 @@ contract LifecycleTest is Fixture {
         _buy(bob, 1_500_000 ether);
         vm.warp(hook.horizonEnd(a));
         uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
         for (uint256 i = 0; i < 3; ++i) {
             hook.observe(a);
             hook.observe(b);
             vm.roll(startBlock + 25 * (i + 1));
+            vm.warp(startTs + 30 minutes * (i + 1));
         }
         vm.warp(hook.horizonEnd(a) + hook.SETTLE_WINDOW() + 1);
         hook.settle(a);
@@ -450,5 +458,45 @@ contract LifecycleTest is Fixture {
         assertEq(hook.potMarg(), 0);
         assertEq(_pot() - potBefore, out);
         assertEq(_claims(address(hook), address(token)), 0);
+    }
+    /// @dev The parked finding: pump, observe one block later, unwind. The adverse rule settles on the honest
+    /// observations around it, so the pumped block is worth nothing to the caller.
+    function testTwoBlockPumpObserveUnwindSettlesWrong() public {
+        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11_000, 1, "+10%"), 10 ether);
+        vm.warp(hook.horizonEnd(id));
+        uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
+        hook.observe(id); // honest, flat
+        vm.roll(startBlock + 25);
+        vm.warp(startTs + 30 minutes);
+        _buy(bob, 1_500_000 ether); // pump
+        assertGt(hook.margPriceInImd(), 1.1e18);
+        vm.roll(startBlock + 26);
+        hook.observe(id); // the pumped block
+        vm.roll(startBlock + 27);
+        _sell(bob, token.balanceOf(bob)); // unwind
+        vm.roll(startBlock + 50);
+        vm.warp(startTs + 60 minutes);
+        hook.observe(id); // honest again
+        vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
+        hook.settle(id);
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Wrong));
+    }
+
+    /// @dev Three observations inside one hour are not a series: the call voids as no-data rather than settling.
+    function testObservationsMustSpanAnHour() public {
+        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11_000, 1, "+10%"), 10 ether);
+        _buy(bob, 1_500_000 ether);
+        vm.warp(hook.horizonEnd(id));
+        uint256 startBlock = block.number;
+        uint256 startTs = block.timestamp;
+        for (uint256 i = 0; i < 3; ++i) {
+            hook.observe(id);
+            vm.roll(startBlock + 25 * (i + 1));
+            vm.warp(startTs + 10 minutes * (i + 1));
+        }
+        vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
+        hook.settle(id);
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidNoData));
     }
 }
