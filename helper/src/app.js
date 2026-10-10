@@ -130,7 +130,14 @@ $('pay').onclick = async () => {
     // 3. Permit2 payment (signature 1)
     // IMD is not a "default asset" for the x402 client's spend controls. The asset and the exact amount are
     // already pinned by the quote the wallet signs in the second signature, so the library guard adds nothing here.
-    const client = x402Client.fromConfig({ schemes: [{ network: req.network, client: new ExactEvmScheme(wallet) }], spendControls: false });
+    // The scheme reads `signer.address` and calls `signer.signTypedData` / `signer.readContract`; a viem wallet
+    // client keeps the address under `account`, so hand it a small adapter.
+    const signer = {
+      address: account,
+      signTypedData: (args) => wallet.signTypedData({ ...args, account }),
+      readContract: (args) => pub.readContract(args),
+    };
+    const client = x402Client.fromConfig({ schemes: [{ network: req.network, client: new ExactEvmScheme(signer) }], spendControls: false });
     const { extensions, ...generated } = await client.createPaymentPayload({ x402Version: 2, resource: ch.resource, accepts: [req] });
     const payment = JSON.parse(JSON.stringify({ ...generated, accepted: req }));
     step('Permit2 payment signed', 'done');
