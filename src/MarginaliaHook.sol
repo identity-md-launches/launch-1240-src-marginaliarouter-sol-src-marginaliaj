@@ -65,7 +65,6 @@ contract MarginaliaHook is IUnlockCallback {
     uint256 public constant SWEEP_AFTER = 28 days; // unclaimed pools roll forward after this
     uint256 public constant LP_FEE = 12_500;
 
-
     /// @dev The IMD oracle (Ethereum mainnet and Robinhood Chain share these addresses).
     address public constant INTAKE = 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56;
     address public constant ORACLE_SIGNER = 0x5598Aa9146215Bc13eb26f2c692Ad1461Fd32982;
@@ -170,7 +169,9 @@ contract MarginaliaHook is IUnlockCallback {
         string text
     );
     event Observed(bytes32 indexed id, uint64 timestamp, uint256 xRead, uint256 quoteRead, uint256 balance);
-    event Settled(bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper);
+    event Settled(
+        bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper
+    );
     event Retracted(bytes32 indexed id, string text);
     event DepositClaimed(bytes32 indexed id, address indexed to, bool asImd, uint256 amount);
     event ThesisReleased(bytes32 indexed id);
@@ -186,7 +187,9 @@ contract MarginaliaHook is IUnlockCallback {
     // ------------------------------------------------------------------ construction
 
     constructor(IPoolManager poolManager_, address token_, address factory_) {
-        if (address(poolManager_).code.length == 0 || token_.code.length == 0 || factory_ == address(0)) revert InvalidUnlock();
+        if (address(poolManager_).code.length == 0 || token_.code.length == 0 || factory_ == address(0)) {
+            revert InvalidUnlock();
+        }
         poolManager = poolManager_;
         token = token_;
         factory = factory_;
@@ -222,7 +225,11 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ pool binding
 
-    function beforeInitialize(address sender, PoolKey calldata key, uint160) external onlyManager returns (bytes4) {
+    function beforeInitialize(address sender, PoolKey calldata key, uint160)
+        external
+        onlyManager
+        returns (bytes4)
+    {
         if (sender != factory || initialized || key.fee != LP_FEE || address(key.hooks) != address(this)) {
             revert InvalidPool();
         }
@@ -265,7 +272,7 @@ contract MarginaliaHook is IUnlockCallback {
     /// @dev Current MARG price in IMD from the bound pool, 1e18 scaled.
     function margPriceInImd() public view returns (uint256) {
         (uint160 sqrtP,,,) = poolManager.getSlot0(poolId);
-        return _pricer().fromSqrt(sqrtP, !imdIs0);
+        return pricer().fromSqrt(sqrtP, !imdIs0);
     }
 
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata data)
@@ -378,16 +385,24 @@ contract MarginaliaHook is IUnlockCallback {
         emit Accrued(day, amount);
     }
 
-    function _decodeNote(bytes calldata data) private pure returns (T.NoteParams memory p, address author, uint256 xResult) {
+    function _decodeNote(bytes calldata data)
+        private
+        pure
+        returns (T.NoteParams memory p, address author, uint256 xResult)
+    {
         (, p, author, xResult) = abi.decode(data, (uint8, T.NoteParams, address, uint256));
         if (author == address(0)) revert BadHookData();
     }
 
     // ------------------------------------------------------------------ notes
 
-    function _postNote(address author, T.NoteParams memory p, uint256 xResult, uint256 depositMarg, uint256 margToAuthor)
-        private
-    {
+    function _postNote(
+        address author,
+        T.NoteParams memory p,
+        uint256 xResult,
+        uint256 depositMarg,
+        uint256 margToAuthor
+    ) private {
         bool thesis = p.targetBps == 0;
         uint256 textLen = bytes(p.text).length;
         if (thesis) {
@@ -398,7 +413,9 @@ contract MarginaliaHook is IUnlockCallback {
             if (p.side == T.Side.Buy) {
                 if (p.targetBps < 10_000 + MIN_TARGET_DELTA_BPS) revert InvalidNote();
             } else {
-                if (p.targetBps >= 10_000 || p.targetBps + MIN_TARGET_DELTA_BPS > 10_000) revert InvalidNote();
+                if (p.targetBps >= 10_000 || p.targetBps + MIN_TARGET_DELTA_BPS > 10_000) {
+                    revert InvalidNote();
+                }
             }
             if (p.x == address(0) || p.x.code.length == 0) revert InvalidNote();
         }
@@ -427,7 +444,7 @@ contract MarginaliaHook is IUnlockCallback {
             n.status = T.Status.ThesisOpen;
             if (weekTheses[_week()].length < MAX_DAY_NOTES) weekTheses[_week()].push(id);
         } else {
-            n.postPrice = _priceInImd(p.venue);
+            n.postPrice = router.postPrice(p.venue, p.side == T.Side.Buy);
             // The MARG this very swap delivers reaches the author after the callback; count it for a note on MARG.
             n.postBalance = IERC20(p.x).balanceOf(author) + (p.x == token ? margToAuthor : 0);
             if (p.parentId != bytes32(0)) {
@@ -438,16 +455,22 @@ contract MarginaliaHook is IUnlockCallback {
         }
         records[author].posted += 1;
         emit NotePosted(
-            id, author, p.x, class, p.side, p.targetBps, p.horizonDays, n.postPrice, depositMarg, p.parentId, xResult, p.text
+            id,
+            author,
+            p.x,
+            class,
+            p.side,
+            p.targetBps,
+            p.horizonDays,
+            n.postPrice,
+            depositMarg,
+            p.parentId,
+            xResult,
+            p.text
         );
     }
 
-    /// @dev X priced in IMD at post time, 1e18 scaled (spot; settlement uses the pricer's rule, never spot alone).
-    function _priceInImd(T.Venue memory v) private view returns (uint256) {
-        return _pricer().postPrice(poolManager, v, imd);
-    }
-
-    function _pricer() private pure returns (MarginaliaPricer) {
+    function pricer() public pure returns (MarginaliaPricer) {
         return MarginaliaPricer(MarginaliaImpls.PRICER);
     }
 
@@ -470,7 +493,7 @@ contract MarginaliaHook is IUnlockCallback {
         if (obs.length > 0 && block.number < obs[obs.length - 1].blockNumber + OBS_GAP_BLOCKS) {
             revert ObservationTooSoon();
         }
-        (uint256 xRead, uint256 quoteRead) = _pricer().observe(poolManager, n.venue, imd);
+        (uint256 xRead, uint256 quoteRead) = pricer().observe(poolManager, n.venue, imd);
         uint256 balance = IERC20(n.x).balanceOf(n.author);
         obs.push(T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance));
         emit Observed(id, uint64(block.timestamp), xRead, quoteRead, balance);
@@ -495,7 +518,7 @@ contract MarginaliaHook is IUnlockCallback {
                     held = false;
                 }
             }
-            settlePrice = _pricer().settlePrice(n.venue, n.side == T.Side.Buy, obs);
+            settlePrice = pricer().settlePrice(n.venue, n.side == T.Side.Buy, obs);
             if (!held) {
                 outcome = T.Status.VoidSold;
             } else if (n.side == T.Side.Buy) {
@@ -601,7 +624,7 @@ contract MarginaliaHook is IUnlockCallback {
     /// @dev log2(claimed multiple) x sqrt(30 / horizon) x mcap tier, scaled 1e4 (MarginaliaPricer).
     function _difficulty(T.Note storage n) private view returns (uint256) {
         uint256 mcap = FullMath.mulDiv(n.postPrice, IERC20(n.x).totalSupply(), 1e18);
-        return _pricer().difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
+        return pricer().difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
     }
 
     // ------------------------------------------------------------------ pot and judging
@@ -646,12 +669,14 @@ contract MarginaliaHook is IUnlockCallback {
         emit PotFunded(_today(), amount, msg.sender);
     }
 
-    /// @notice Converts forfeited MARG into IMD for the pools. Judge-only so the timing is predictable.
+    /// @notice Converts forfeited MARG using the router's mature price history for the slippage floor.
     function sellPotMarg(uint256 amount) external returns (uint256 imdOut) {
         if (msg.sender != address(judge)) revert Unauthorized();
         if (amount == 0 || amount > potMarg) revert PotTooSmall();
         potMarg -= amount;
-        imdOut = _unlock(ACT_SELL, address(0), amount, _minImdOut(amount));
+        T.Venue memory venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(poolId), imd, !imdIs0);
+        uint256 minimum = FullMath.mulDiv(amount, router.postPrice(venue, true), 1e18) * 97 / 100;
+        imdOut = _unlock(ACT_SELL, address(0), amount, minimum);
         _accrue(imdOut);
         emit PotMargSold(amount, imdOut, _today());
     }
@@ -667,7 +692,11 @@ contract MarginaliaHook is IUnlockCallback {
     }
 
     /// @notice Who wrote a note and in which week: what the judge needs to filter the panel's ranking.
-    function noteMeta(bytes32 id) external view returns (address author, uint32 w, bool thesis, bool hasChild) {
+    function noteMeta(bytes32 id)
+        external
+        view
+        returns (address author, uint32 w, bool thesis, bool hasChild)
+    {
         T.Note storage n = notes[id];
         return (n.author, uint32(uint256(n.postedAt) / 7 days), n.targetBps == 0, n.children > 0);
     }
@@ -762,7 +791,10 @@ contract MarginaliaHook is IUnlockCallback {
         return uint256(uint160(c));
     }
 
-    function _unlock(uint8 action, address to, uint256 amount, uint256 extra) private returns (uint256 result) {
+    function _unlock(uint8 action, address to, uint256 amount, uint256 extra)
+        private
+        returns (uint256 result)
+    {
         bytes memory data = abi.encode(action, to, amount, extra);
         unlockHash = keccak256(data);
         bytes memory out = poolManager.unlock(data);
@@ -773,7 +805,8 @@ contract MarginaliaHook is IUnlockCallback {
     function unlockCallback(bytes calldata data) external onlyManager returns (bytes memory) {
         if (unlockHash == bytes32(0) || keccak256(data) != unlockHash) revert InvalidUnlock();
         delete unlockHash;
-        (uint8 action, address to, uint256 amount, uint256 extra) = abi.decode(data, (uint8, address, uint256, uint256));
+        (uint8 action, address to, uint256 amount, uint256 extra) =
+            abi.decode(data, (uint8, address, uint256, uint256));
         if (action == ACT_PAY) {
             address currency = address(uint160(extra));
             poolManager.burn(address(this), _id(currency), amount);
@@ -827,5 +860,4 @@ contract MarginaliaHook is IUnlockCallback {
     function noteOf(bytes32 id) external view returns (T.Note memory) {
         return _note(id);
     }
-
 }

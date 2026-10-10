@@ -14,20 +14,26 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {MarginaliaTypes as T} from "./MarginaliaTypes.sol";
+import {MarginaliaPricer} from "./MarginaliaPricer.sol";
 
 interface IMarginaliaHook {
     function getPoolKey() external view returns (PoolKey memory);
     function imd() external view returns (address);
     function token() external view returns (address);
+    function pricer() external view returns (MarginaliaPricer);
 }
 
 interface IUniswapV3PoolSwap {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function fee() external view returns (uint24);
-    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
-        external
-        returns (int256 amount0, int256 amount1);
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
 }
 
 interface IUniswapV3FactoryMinimal {
@@ -94,6 +100,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
 
     bytes32 private jobHash;
     address private v3Pending;
+    mapping(bytes32 => T.PriceWindow) public priceWindows;
 
     error UnauthorizedCallback();
     error InvalidSwap();
@@ -102,9 +109,18 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     error NoteTokenMismatch();
     error AlreadyInitialised();
     error BadVenue();
+    error OnlyHook();
 
     event Noted(address indexed author, bool sellMarg, uint256 spent, uint256 received);
-    event XTraded(address indexed trader, uint8 kind, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
+    event XTraded(
+        address indexed trader,
+        uint8 kind,
+        address indexed xIn,
+        address indexed xOut,
+        uint256 spent,
+        uint256 received
+    );
+    event VenueCheckpointed(bytes32 indexed venue, uint64 startedAt);
 
     /// @dev The implementation locks itself; only clones (zero storage) can be initialised, once, by the hook.
     constructor() {
@@ -113,6 +129,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
 
     function init(IPoolManager manager_, address hook_) external {
         if (address(hook) != address(0)) revert AlreadyInitialised();
+        if (msg.sender != hook_) revert OnlyHook();
         require(address(manager_).code.length > 0 && hook_ != address(0), "configuration required");
         manager = manager_;
         hook = IMarginaliaHook(hook_);
@@ -120,24 +137,44 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
 
     // ------------------------------------------------------------------ entry points
 
+    /// @notice Anyone may begin or extend a canonical venue's price history before posting a call.
+    /// The first checkpoint must age for an hour; checkpoints expire after six hours. A live
+    /// window cannot be reset, so an honest spot pins its conservative extreme until expiry.
+    function checkpointVenue(T.NoteParams memory p, PoolKey memory v4Key) external nonReentrant {
+        T.Venue memory v = validateVenue(p, v4Key);
+        bytes32 id = keccak256(abi.encode(v));
+        T.PriceWindow memory w = hook.pricer().checkpoint(manager, v, hook.imd(), priceWindows[id]);
+        priceWindows[id] = w;
+        emit VenueCheckpointed(id, w.startedAt);
+    }
+
+    /// @notice Read the baseline using this router's authenticated, prior venue checkpoints.
+    function postPrice(T.Venue memory v, bool buy) external view returns (uint256) {
+        return hook.pricer().postPrice(manager, v, hook.imd(), buy, priceWindows[keccak256(abi.encode(v))]);
+    }
+
     /// @notice Post a note by buying MARG. Class is Declared unless the author is a contract (Agent).
     /// @param v4Key For a v4 price venue, the full pool key (ignored otherwise).
-    function note(T.NoteParams calldata p, PoolKey calldata v4Key, uint256 imdIn, uint256 minMargOut, uint256 deadline)
-        external
-        nonReentrant
-        returns (uint256)
-    {
+    function note(
+        T.NoteParams calldata p,
+        PoolKey calldata v4Key,
+        uint256 imdIn,
+        uint256 minMargOut,
+        uint256 deadline
+    ) external nonReentrant returns (uint256) {
         XTrade memory noX;
         return _run(false, imdIn, minMargOut, deadline, noX, p, v4Key);
     }
 
     /// @notice Sell MARG with a note attached: 1% plus the stamp instead of the quiet 3%, and the deposit
     /// comes off the MARG sold.
-    function sellWithNote(T.NoteParams calldata p, PoolKey calldata v4Key, uint256 margIn, uint256 minImdOut, uint256 deadline)
-        external
-        nonReentrant
-        returns (uint256)
-    {
+    function sellWithNote(
+        T.NoteParams calldata p,
+        PoolKey calldata v4Key,
+        uint256 margIn,
+        uint256 minImdOut,
+        uint256 deadline
+    ) external nonReentrant returns (uint256) {
         XTrade memory noX;
         return _run(true, margIn, minImdOut, deadline, noX, p, v4Key);
     }
@@ -175,7 +212,9 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
             IUniswapV3PoolSwap pool = IUniswapV3PoolSwap(address(uint160(uint256(v.ref))));
             t0 = pool.token0();
             t1 = pool.token1();
-            if (IUniswapV3FactoryMinimal(UNIV3_FACTORY).getPool(t0, t1, pool.fee()) != address(pool)) revert BadVenue();
+            if (IUniswapV3FactoryMinimal(UNIV3_FACTORY).getPool(t0, t1, pool.fee()) != address(pool)) {
+                revert BadVenue();
+            }
         } else if (v.kind == T.VenueKind.UniV2) {
             IUniswapV2PairSwap pair = IUniswapV2PairSwap(address(uint160(uint256(v.ref))));
             t0 = pair.token0();
@@ -230,7 +269,8 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
                 job.x = x; // traded inside the unlock
             } else {
                 x.amountIn = _pull(x.tokenIn, x.amountIn);
-                (job.xResult, job.xIn, job.xOut) = x.kind == X_V3 ? _tradeV3(msg.sender, x) : _tradeV2(msg.sender, x);
+                (job.xResult, job.xIn, job.xOut) =
+                    x.kind == X_V3 ? _tradeV3(msg.sender, x) : _tradeV2(msg.sender, x);
                 _checkSubject(job);
             }
         }
@@ -273,7 +313,11 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
 
         BalanceDelta delta = manager.swap(
             key,
-            SwapParams(zeroForOne, -int256(job.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                zeroForOne,
+                -int256(job.amountIn),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             hookData
         );
         int128 inputDelta = zeroForOne ? delta.amount0() : delta.amount1();
@@ -286,20 +330,29 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         Currency receiveCurrency = zeroForOne ? key.currency1 : key.currency0;
         _pay(payCurrency, spent);
         manager.take(receiveCurrency, job.payer, received);
-        if (spent < job.amountIn) IERC20(Currency.unwrap(payCurrency)).safeTransfer(job.payer, job.amountIn - spent);
+        if (spent < job.amountIn) {
+            IERC20(Currency.unwrap(payCurrency)).safeTransfer(job.payer, job.amountIn - spent);
+        }
         emit Noted(job.payer, job.sellMarg, spent, received);
         return abi.encode(received);
     }
 
     // ------------------------------------------------------------------ X legs
 
-    function _tradeV4(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    function _tradeV4(address payer, XTrade memory x)
+        private
+        returns (uint256 received, address xIn, address xOut)
+    {
         // A v4 trade venue must be a real pool: liquidity and a hookless or Marginalia-hooked key.
         if (address(x.key.hooks) != address(0) && address(x.key.hooks) != address(hook)) revert BadVenue();
         if (manager.getLiquidity(x.key.toId()) == 0) revert BadVenue();
         BalanceDelta delta = manager.swap(
             x.key,
-            SwapParams(x.zeroForOne, -int256(x.amountIn), x.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                x.zeroForOne,
+                -int256(x.amountIn),
+                x.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             ""
         );
         int128 inputDelta = x.zeroForOne ? delta.amount0() : delta.amount1();
@@ -319,7 +372,10 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @dev Exact-input swap against a canonical v3 pool; the pool pays the recipient, we pay in the callback.
-    function _tradeV3(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    function _tradeV3(address payer, XTrade memory x)
+        private
+        returns (uint256 received, address xIn, address xOut)
+    {
         IUniswapV3PoolSwap pool = IUniswapV3PoolSwap(x.pool);
         address t0 = pool.token0();
         address t1 = pool.token1();
@@ -331,7 +387,11 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         uint256 before = IERC20(xOut).balanceOf(payer);
         v3Pending = x.pool;
         (int256 a0, int256 a1) = pool.swap(
-            payer, zeroForOne, int256(x.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1, ""
+            payer,
+            zeroForOne,
+            int256(x.amountIn),
+            zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
+            ""
         );
         delete v3Pending;
         uint256 spent = uint256(zeroForOne ? a0 : a1);
@@ -349,7 +409,10 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @dev Exact-input swap against a canonical v2 pair: send the input, take the constant-product output.
-    function _tradeV2(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    function _tradeV2(address payer, XTrade memory x)
+        private
+        returns (uint256 received, address xIn, address xOut)
+    {
         IUniswapV2PairSwap pair = IUniswapV2PairSwap(x.pool);
         address t0 = pair.token0();
         address t1 = pair.token1();

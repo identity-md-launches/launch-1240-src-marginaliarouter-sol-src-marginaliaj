@@ -41,7 +41,8 @@ contract LiquidityHelper is IUnlockCallback {
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(manager));
-        (PoolKey memory key, ModifyLiquidityParams memory p) = abi.decode(data, (PoolKey, ModifyLiquidityParams));
+        (PoolKey memory key, ModifyLiquidityParams memory p) =
+            abi.decode(data, (PoolKey, ModifyLiquidityParams));
         (BalanceDelta delta,) = manager.modifyLiquidity(key, p, "");
         _settle(key.currency0, delta.amount0());
         _settle(key.currency1, delta.amount1());
@@ -69,7 +70,10 @@ contract TestSwapRouter is IUnlockCallback {
         manager = m;
     }
 
-    function swap(PoolKey memory key, bool zeroForOne, uint256 amountIn, address payer) external returns (uint256 received) {
+    function swap(PoolKey memory key, bool zeroForOne, uint256 amountIn, address payer)
+        external
+        returns (uint256 received)
+    {
         return abi.decode(manager.unlock(abi.encode(key, zeroForOne, amountIn, payer)), (uint256));
     }
 
@@ -79,7 +83,11 @@ contract TestSwapRouter is IUnlockCallback {
             abi.decode(data, (PoolKey, bool, uint256, address));
         BalanceDelta d = manager.swap(
             key,
-            SwapParams(zeroForOne, -int256(amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                zeroForOne,
+                -int256(amountIn),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             ""
         );
         int128 inD = zeroForOne ? d.amount0() : d.amount1();
@@ -162,12 +170,14 @@ abstract contract Fixture is Test {
 
     function _deployHook(IPoolManager m, address t) internal returns (MarginaliaHook result) {
         _etchImpls();
-        bytes memory code = abi.encodePacked(type(MarginaliaHook).creationCode, abi.encode(m, t, address(this)));
+        bytes memory code =
+            abi.encodePacked(type(MarginaliaHook).creationCode, abi.encode(m, t, address(this)));
         bytes32 hash = keccak256(code);
         for (uint256 i = 0; i < 300_000; ++i) {
             bytes32 salt = bytes32(i);
-            address predicted =
-                address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, hash)))));
+            address predicted = address(
+                uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, hash))))
+            );
             if (!HookFlags.matches(predicted, HookFlags.MARGINALIA)) continue;
             address deployed;
             assembly ("memory-safe") {
@@ -221,6 +231,10 @@ abstract contract Fixture is Test {
         // Cloned companions: etched implementations above, and the clones must not be re-initialisable.
         vm.expectRevert(MarginaliaRouter.AlreadyInitialised.selector);
         router.init(manager, address(this));
+        // A note baseline needs a genuine earlier checkpoint, including in local rehearsals.
+        router.checkpointVenue(_margNote(T.Side.Buy, 11_000, 1, "checkpoint"), key);
+        vm.warp(block.timestamp + 1 hours);
+        vm.roll(block.number + 300);
     }
 
     function _margNote(T.Side side, uint32 targetBps, uint16 horizonDays, string memory text)
@@ -237,7 +251,10 @@ abstract contract Fixture is Test {
         p.text = text;
     }
 
-    function _note(address who, T.NoteParams memory p, uint256 imdIn) internal returns (bytes32 id, uint256 received) {
+    function _note(address who, T.NoteParams memory p, uint256 imdIn)
+        internal
+        returns (bytes32 id, uint256 received)
+    {
         vm.prank(who);
         received = router.note(p, key, imdIn, 1, block.timestamp + 1);
         id = bytes32(hook.noteCount());

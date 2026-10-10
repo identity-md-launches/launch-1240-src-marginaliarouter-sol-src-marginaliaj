@@ -22,6 +22,7 @@ contract MarginaliaTreasury {
     error AlreadyDripped();
     error NothingToDrip();
     error AlreadyInitialised();
+    error OnlyHook();
 
     event Dripped(uint32 indexed day, uint256 amount);
 
@@ -32,6 +33,7 @@ contract MarginaliaTreasury {
 
     function init(address hook_) external {
         if (address(hook) != address(0)) revert AlreadyInitialised();
+        if (msg.sender != hook_) revert OnlyHook();
         require(hook_ != address(0), "configuration required");
         hook = IHookPot(hook_);
     }

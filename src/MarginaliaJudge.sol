@@ -13,7 +13,10 @@ interface IHookJudge {
     function potMarg() external view returns (uint256);
     function week() external view returns (uint32);
     function thesesOfWeek(uint32 week) external view returns (bytes32[] memory);
-    function noteMeta(bytes32 id) external view returns (address author, uint32 week, bool thesis, bool hasChild);
+    function noteMeta(bytes32 id)
+        external
+        view
+        returns (address author, uint32 week, bool thesis, bool hasChild);
     function sellPotMarg(uint256 amount) external returns (uint256);
     function drawForJudging(uint32 week, uint256 amount, bool retry) external;
     function payJudged(uint32 day, bytes32[3] calldata top) external;
@@ -40,7 +43,7 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     mapping(uint32 => bytes32) public requestOf;
     mapping(uint32 => uint64) public requestedAt;
     mapping(bytes32 => uint32) private pendingDay; // day + 1, never zero
-    mapping(uint32 => bytes32[]) private rawRanked; // the panel's answer, filtered lazily in payJudged
+    mapping(uint32 => bytes32[]) private rawRanked; // the requested head of three, filtered lazily in payJudged
     mapping(uint32 => bool) public judgedSet;
     mapping(uint32 => bool) public paid;
 
@@ -54,6 +57,7 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     error NotJudged();
     error AlreadyPaid();
     error AlreadyInitialised();
+    error OnlyHook();
 
     event Requested(uint32 indexed day, bytes32 indexed requestId, uint256 price);
     event Judged(uint32 indexed day, bytes32[3] ids);
@@ -66,7 +70,10 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     /// @dev Called once by the hook on its clone, in the hook's constructor.
     function init(address hook_, address intake_, bytes32 action_, address signer_) external {
         if (address(hook) != address(0)) revert AlreadyInitialised();
-        require(hook_ != address(0) && intake_ != address(0) && action_ != bytes32(0), "configuration required");
+        if (msg.sender != hook_) revert OnlyHook();
+        require(
+            hook_ != address(0) && intake_ != address(0) && action_ != bytes32(0), "configuration required"
+        );
         hook = IHookJudge(hook_);
         intake = IIntake(intake_);
         action = action_;
@@ -91,7 +98,9 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
             if (hasChild) tmp[n++] = all[i];
         }
         out = new bytes32[](n);
-        for (uint256 i = 0; i < n; ++i) out[i] = tmp[i];
+        for (uint256 i = 0; i < n; ++i) {
+            out[i] = tmp[i];
+        }
     }
 
     /// @notice The oracle body for a week: deterministic from the week's eligible thesis ids, so anyone can check it.
@@ -99,13 +108,18 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         bytes32[] memory ids = eligibleTheses(week);
         bytes memory allow;
         for (uint256 i = 0; i < ids.length; ++i) {
-            allow = bytes.concat(allow, i == 0 ? bytes('"') : bytes(',"'), _hex(uint256(ids[i]), 32), bytes('"'));
+            allow =
+                bytes.concat(allow, i == 0 ? bytes('"') : bytes(',"'), _hex(uint256(ids[i]), 32), bytes('"'));
         }
         return string(
             bytes.concat(
-                bytes('{"v":1,"question":"Rank the three best-argued Marginalia theses among these ids by verifiable reasoning and citations (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments, sourced claims). A thesis without reasoning scores zero. Ignore whether its calls proved right.","chainId":'),
+                bytes(
+                    '{"v":1,"question":"Rank the three best-argued Marginalia theses among these ids by verifiable reasoning and citations (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments, sourced claims). A thesis without reasoning scores zero. Ignore whether its calls proved right.","chainId":'
+                ),
                 _dec(block.chainid),
-                bytes(',"window":{"hours":168},"answerType":"bytes32[]","evidence":"panel","head":3,"panelSize":'),
+                bytes(
+                    ',"window":{"hours":168},"answerType":"bytes32[]","evidence":"panel","head":3,"panelSize":'
+                ),
                 _dec(PANEL_SIZE),
                 bytes(',"quorum":'),
                 _dec(QUORUM),
@@ -134,7 +148,9 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     function _dec(uint256 v) private pure returns (bytes memory) {
         if (v == 0) return "0";
         uint256 n;
-        for (uint256 t = v; t > 0; t /= 10) ++n;
+        for (uint256 t = v; t > 0; t /= 10) {
+            ++n;
+        }
         bytes memory out = new bytes(n);
         for (uint256 i = n; i > 0; --i) {
             out[i - 1] = bytes1(uint8(48 + v % 10));
@@ -147,7 +163,9 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     function weekClosed(uint32 week) external view returns (bool) {
         if (week >= hook.week()) return false;
         if (judgedSet[week]) return false;
-        if (requestOf[week] != bytes32(0) && block.timestamp < requestedAt[week] + ANSWER_DEADLINE) return false;
+        if (requestOf[week] != bytes32(0) && block.timestamp < requestedAt[week] + ANSWER_DEADLINE) {
+            return false;
+        }
         return eligibleTheses(week).length == 0 || block.timestamp >= (uint256(week) + 1) * 7 days + 28 days;
     }
 
@@ -156,7 +174,9 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     function requestJudging(uint32 day) external nonReentrant returns (bytes32 requestId) {
         if (day >= hook.week()) revert DayNotOver();
         bool retry = requestOf[day] != bytes32(0);
-        if (judgedSet[day] || (retry && block.timestamp < requestedAt[day] + ANSWER_DEADLINE)) revert AlreadyRequested();
+        if (judgedSet[day] || (retry && block.timestamp < requestedAt[day] + ANSWER_DEADLINE)) {
+            revert AlreadyRequested();
+        }
         if (eligibleTheses(day).length == 0) revert NoNotes();
         address imd = hook.imd();
         uint256 price = intake.priceOf(action, imd);
@@ -165,7 +185,9 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         hook.drawForJudging(day, price, retry);
         IERC20(imd).forceApprove(address(intake), price);
         bytes memory body = bytes(questionBody(day));
-        requestId = intake.request(action, body, IIntake.Callback(address(this), this.onOracleResult.selector), imd, price);
+        requestId = intake.request(
+            action, body, IIntake.Callback(address(this), this.onOracleResult.selector), imd, price
+        );
         IERC20(imd).forceApprove(address(intake), 0);
         if (pendingDay[requestId] != 0) revert AlreadyRequested();
         requestOf[day] = requestId;
@@ -174,27 +196,42 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         emit Requested(day, requestId, price);
     }
 
-    /// @notice The Intake delivers the panel's ranking here. Verified, filtered to the day's notes, stored.
-    function onOracleResult(bytes32 requestId, OracleAttestation.Attestation calldata a, bytes calldata signature)
-        external
-        nonReentrant
-    {
+    /// @notice The Intake delivers the panel's ranking here. Verify and store the requested head;
+    /// filter it against eligible theses later, outside the callback's gas stipend.
+    function onOracleResult(
+        bytes32 requestId,
+        OracleAttestation.Attestation calldata a,
+        bytes calldata signature
+    ) external nonReentrant {
         if (msg.sender != address(intake)) revert OnlyIntake();
         uint32 stored = pendingDay[requestId];
         if (stored == 0) revert UnknownRequest();
         delete pendingDay[requestId];
         uint32 day = stored - 1;
         _verifyAttestation(a, signature);
-        if (a.agreed < a.quorum || a.quorum < QUORUM || a.panelSize < PANEL_SIZE || judgedSet[day]) revert BadAnswer();
+        if (a.agreed < a.quorum || a.quorum < QUORUM || a.panelSize < PANEL_SIZE || judgedSet[day]) {
+            revert BadAnswer();
+        }
         bytes32[] memory ranked = decodeBytes32List(a);
-        if (ranked.length == 0) revert BadAnswer();
         _consume(a.requestId);
-        rawRanked[day] = ranked; // filtered in payJudged: the Intake gives this callback 200k gas
+        // The question requests head=3. Bound storage writes to fit the Intake's 200k callback
+        // even if the panel returns its entire ranking; filtering stays in the later payment call.
+        uint256 count = ranked.length < 3 ? ranked.length : 3;
+        for (uint256 i; i < count; ++i) {
+            rawRanked[day].push(ranked[i]);
+        }
         judgedSet[day] = true;
-        emit Judged(day, [ranked[0], ranked.length > 1 ? ranked[1] : bytes32(0), ranked.length > 2 ? ranked[2] : bytes32(0)]);
+        emit Judged(
+            day,
+            [
+                count > 0 ? ranked[0] : bytes32(0),
+                count > 1 ? ranked[1] : bytes32(0),
+                count > 2 ? ranked[2] : bytes32(0)
+            ]
+        );
     }
 
-    /// @notice The panel's ranking filtered to the week's own theses, deduplicated, top three.
+    /// @notice The requested head of the panel's ranking, filtered to this week's theses and deduplicated.
     function judgedOf(uint32 day) public view returns (bytes32[3] memory top) {
         bytes32[] storage ranked = rawRanked[day];
         uint256 kept;
@@ -210,12 +247,12 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         }
     }
 
-    /// @notice Pays a judged week. Anyone may call it once the ranking is in.
+    /// @notice Pays a judged week. An empty eligible head rolls the full thesis pool forward.
+    /// Anyone may call it once the ranking is in.
     function payJudged(uint32 day) external nonReentrant {
         if (!judgedSet[day]) revert NotJudged();
         if (paid[day]) revert AlreadyPaid();
         bytes32[3] memory top = judgedOf(day);
-        if (top[0] == bytes32(0)) revert BadAnswer();
         paid[day] = true;
         hook.payJudged(day, top);
     }

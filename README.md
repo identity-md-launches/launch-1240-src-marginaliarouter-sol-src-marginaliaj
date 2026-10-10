@@ -1,10 +1,10 @@
 # Marginalia — notes in the margin of every trade
 
-A Uniswap v4 hook launch on the IMD protocol (Ethereum mainnet, paired with IMD). Buying MARG through the
+This launch deploys four Marginalia companion implementations on Ethereum mainnet: Router, Judge, Treasury and Pricer, all with no constructor arguments. The token and Uniswap v4 hook belong to a later launch. Buying MARG through the
 router with a note attached posts a falsifiable call on any ERC-20, backed by a flat stamp and a flat
 refundable deposit. Calls resolve against a manipulation-resistant settlement price built from permissionless
 on-chain observations (v3/v2 TWAPs, the adverse extreme on v4); right calls get their deposit back,
-everything else feeds a pot that pays the best-argued notes of the day, ranked by the IMD oracle panel.
+everything else feeds the weekly pools, including thesis prizes ranked by the IMD oracle panel.
 No owner, no pause, no upgrade. Spec: `SPEC.md`.
 
 ## Contracts
@@ -16,7 +16,7 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
 | `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pools daily. No withdraw; refuses ETH. |
-| `MarginaliaPricer` | Stateless, ownerless helper the hook calls by staticcall (kept out of the hook for code size): score arithmetic (log2, sqrt, difficulty), price reads and the settlement rule: post-time spot; observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. One honest observation pins the extreme, so a pump must be held for the whole ≥1 h span. |
+| `MarginaliaPricer` | Stateless, ownerless helper the hook calls by staticcall (kept out of the hook for code size): score arithmetic (log2, sqrt, difficulty), price reads and the settlement rule: a prior-window baseline (v3/v2 accumulator TWAP, conservative v4/hub extreme); observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. An honest observation pins the extreme; the series must span at least one hour. |
 
 ## How the pot pays
 
@@ -37,10 +37,10 @@ except through the score, which is difficulty-weighted, netted against wrong cal
    (ownerless; they lock themselves in their constructors so only clones can be initialised, once, by the hook)
    plus the stateless `MarginaliaPricer`.
 2. Set the four addresses in `src/MarginaliaImpls.sol`.
-3. Hook launch (`launch.json`): the factory deploys the token and the hook; the hook's constructor clones
+3. Later hook launch (its manifest is produced separately): the factory deploys the token and the hook; the hook's constructor clones
    the three implementations and initialises each with itself in the same transaction.
 
-The hook's initcode is ~24.5 KB (EIP-3860 cap 49,152) and its runtime ~23 KB (EIP-170 cap 24,576);
+The hook's initcode is 25,469 bytes (EIP-3860 cap 49,152) and its runtime 23,864 bytes (EIP-170 cap 24,576);
 `forge build --sizes` is the gate for both.
 
 ## Build and test
@@ -53,6 +53,7 @@ forge build --sizes
 forge test --no-match-path 'test/fork/*'
 ```
 
+Without `MAINNET_RPC_URL`, the fork tests explicitly skip, including under plain `forge test`.
 The fork rehearsal deploys through the real IMD LaunchFactory on an Ethereum mainnet fork, impersonating
 the protocol's launch wallet, and then posts a note through the router:
 
@@ -62,9 +63,30 @@ MAINNET_RPC_URL=https://... forge test --match-path test/fork/MainnetLaunch.t.so
 
 ## Launch
 
-`launch.json` is the factory manifest: `MarginaliaHook($poolManager, $token, $factory)`, permissions as
-listed, pool paired with IMD at fee 12500 / tick spacing 60. The requester's share seeds the pool
-single-sided; the swarm's 10% goes to the launch's distributor.
+The next launch step writes the contracts-only manifest for `MarginaliaRouter`, `MarginaliaJudge`,
+`MarginaliaTreasury` and `MarginaliaPricer`, with empty constructor argument lists. This repository no
+longer carries the old hook-launch manifest. No token or pool is deployed by this launch. The first
+three implementations are deliberately locked; only their later, atomically initialized clones hold
+application state. See `ADAPTATION.md` for the reproduced findings, changes and validation.
+
+Before posting a price call, anyone calls `router.checkpointVenue(noteParams, venueKey)` for its
+canonical venue. Its first checkpoint must be at least one hour old, from an earlier block, and at
+most six hours old. Further checkpoints preserve the start and accumulate conservative extremes;
+they cannot erase an honest reading. After expiry, checkpoint again and allow a new hour to elapse.
+Theses (`targetBps == 0`) do not need price history. This warm-up uses on-chain timestamps; tests
+advance the EVM clock and never wait in real time.
+
+For v3/v2, the post baseline is the accumulator TWAP from the checkpoint to posting. For v4 and
+the ETH/IMD hub leg, a BUY baseline uses the maximum of the window's readings and the current
+price, and SELL uses the minimum. Settlement retains the opposite extremes and its existing
+one-hour minimum span. `judge.convertForfeits()` requires the same mature history for the MARG/IMD
+venue and enforces 97% of its conservative maximum as the minimum IMD output. A fall beyond the
+floor defers conversion until a fresh window supports it. Calls and checkpoint reads reject a v4
+venue or hub with no active liquidity.
+
+The oracle callback stores only the requested head of three ids, then filters and deduplicates them
+when paid. A signed empty or entirely ineligible head pays no winners and rolls the whole remaining
+thesis pool forward. Extra ranking entries beyond the requested head are ignored.
 
 ## Audit history
 
@@ -82,14 +104,14 @@ round had not closed: `observe()` read spot, so a two-block pump → observe →
 for swap fees. v0.5 moved settlement into `MarginaliaPricer`: Uniswap v3 and v2 venues settle on the
 time-weighted average between the first and last observation (their on-chain accumulators), v4 venues
 and the ETH→IMD hub leg settle on the observation least favourable to the call, and the observations
-must span at least an hour. A pump now has to be held for the whole span against every arbitrageur, and
-any honest observer can pin the price. Tests: `testTwoBlockPumpObserveUnwindSettlesWrong` (local),
+must span at least an hour. Accumulator prices weight the elapsed time, and an honest observer can
+pin the v4/hub extreme; sampled extremes do not measure prices between observations. Tests: `testTwoBlockPumpObserveUnwindSettlesWrong` (local),
 `testTradeAndNoteOnUniswapV3` settles LINK on the live v3 accumulator (fork), `test/Pricer.t.sol`.
 
 ## v1 scope and known limits
 
 - Price reads assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
-- v4 venues have no on-chain accumulator, so they settle on the adverse extreme rather than a TWAP: a
+- v4 venues have no on-chain accumulator, so their baseline and settlement rely on sampled extremes rather than a TWAP. These require honest permissionless observations; time spacing alone cannot prove an unobserved price was held continuously. A
   single hostile observation can push a genuine call to WRONG only by moving the pool against it at that
   block, which costs the mover the same swap fees and arbitrage exposure as a pump.
 - Sells of MARG pay 3% through any router, or 1% plus the stamp through `sellWithNote` with a note and deposit attached.

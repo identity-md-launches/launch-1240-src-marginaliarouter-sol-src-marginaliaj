@@ -67,6 +67,18 @@ library MarginaliaTypes {
         uint256 balance;
     }
 
+    /// @dev A bounded pre-post window, stored by the router. Accumulator venues retain the first
+    /// reading; spot-only legs retain both extremes so callers cannot replace an honest checkpoint.
+    struct PriceWindow {
+        uint64 startedAt;
+        uint64 blockNumber;
+        uint256 xStart;
+        uint256 xMin;
+        uint256 xMax;
+        uint256 quoteMin;
+        uint256 quoteMax;
+    }
+
     struct Note {
         address author;
         address x;

@@ -17,13 +17,17 @@ interface IUniswapV3PoolOracle {
 }
 
 interface IUniswapV2PairOracle {
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function getReserves()
+        external
+        view
+        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
     function price0CumulativeLast() external view returns (uint256);
     function price1CumulativeLast() external view returns (uint256);
 }
 
 /// @notice Stateless price reads and score arithmetic for Marginalia. Every price is "IMD per 1e18 of X", 1e18 scaled, 18-decimal
-/// assets assumed on both sides (a documented v1 limitation). No state, no owner: the pool is the only input.
+/// assets assumed on both sides (a documented v1 limitation). No state or owner: pool reads and caller-supplied
+/// history are the inputs; the router authenticates and stores the posting history.
 ///
 /// Settlement never trusts a single block. Venues with an on-chain accumulator (Uniswap v3 tick cumulatives,
 /// Uniswap v2 price cumulatives) settle on the time-weighted average between the first and last observation,
@@ -45,6 +49,10 @@ contract MarginaliaPricer {
     error EmptyPool();
     error Unsupported();
     error QuoteNotPriceable();
+    error PriceHistoryUnavailable();
+
+    uint256 public constant POST_MIN_SPAN = 1 hours;
+    uint256 public constant POST_MAX_AGE = 6 hours;
 
     // ------------------------------------------------------------------ score arithmetic
 
@@ -57,7 +65,11 @@ contract MarginaliaPricer {
     /// @param buy true for a BUY call (target > 1), false for a SELL call (target < 1)
     /// @param horizonDays 1..90
     /// @param mcapImd the token's market cap at post time, in IMD (1e18)
-    function difficulty(uint32 targetBps, bool buy, uint16 horizonDays, uint256 mcapImd) external pure returns (uint256) {
+    function difficulty(uint32 targetBps, bool buy, uint16 horizonDays, uint256 mcapImd)
+        external
+        pure
+        returns (uint256)
+    {
         uint256 ratio = buy ? targetBps : FullMath.mulDiv(10_000, 10_000, targetBps);
         uint256 l2 = log2x1e4(ratio);
         uint256 s = sqrt(FullMath.mulDiv(30, 1e8, horizonDays)); // sqrt(30/h) × 1e4
@@ -96,9 +108,47 @@ contract MarginaliaPricer {
 
     // ------------------------------------------------------------------ post time
 
-    /// @notice Spot price of X in IMD at post time (context for the call; settlement never reuses it alone).
-    function postPrice(IPoolManager manager, T.Venue memory v, address imd) external view returns (uint256) {
-        return FullMath.mulDiv(_spotInQuote(manager, v), _quoteSpot(manager, v.quote, imd), 1e18);
+    /// @notice Extend a router-held window without replacing its start or its conservative extremes.
+    /// An expired window starts again and must mature for an hour before it can price a post.
+    function checkpoint(IPoolManager manager, T.Venue memory v, address imd, T.PriceWindow memory w)
+        external
+        view
+        returns (T.PriceWindow memory)
+    {
+        (uint256 x, uint256 q) = observe(manager, v, imd);
+        if (w.startedAt == 0 || block.timestamp > uint256(w.startedAt) + POST_MAX_AGE) {
+            return T.PriceWindow(uint64(block.timestamp), uint64(block.number), x, x, x, q, q);
+        }
+        if (v.kind == T.VenueKind.UniV4) {
+            w.xMin = _adverse(w.xMin, x, true);
+            w.xMax = _adverse(w.xMax, x, false);
+        }
+        w.quoteMin = _adverse(w.quoteMin, q, true);
+        w.quoteMax = _adverse(w.quoteMax, q, false);
+        return w;
+    }
+
+    /// @notice A baseline adverse to the call: TWAP since the checkpoint on v3/v2; the maximum
+    /// for BUY / minimum for SELL on v4 and the hub leg, including the current reading.
+    /// This reverses settlement's extreme because the baseline is the target's denominator.
+    function postPrice(IPoolManager manager, T.Venue memory v, address imd, bool buy, T.PriceWindow memory w)
+        external
+        view
+        returns (uint256)
+    {
+        if (
+            w.startedAt == 0 || block.number <= w.blockNumber
+                || block.timestamp < uint256(w.startedAt) + POST_MIN_SPAN
+                || block.timestamp > uint256(w.startedAt) + POST_MAX_AGE
+        ) revert PriceHistoryUnavailable();
+        (uint256 x, uint256 q) = observe(manager, v, imd);
+        if (v.kind == T.VenueKind.UniV4) {
+            x = _adverse(buy ? w.xMax : w.xMin, x, !buy);
+        } else {
+            x = twap(v.kind, v.xIsToken0, w.xStart, w.startedAt, x, uint64(block.timestamp));
+        }
+        q = _adverse(buy ? w.quoteMax : w.quoteMin, q, !buy);
+        return FullMath.mulDiv(x, q, 1e18);
     }
 
     // ------------------------------------------------------------------ observations
@@ -106,7 +156,7 @@ contract MarginaliaPricer {
     /// @notice What one observation records: the venue's accumulator (v3 tick cumulative as int256 bits, v2
     /// price cumulative) or its spot (v4), and the quote leg's spot in IMD.
     function observe(IPoolManager manager, T.Venue memory v, address imd)
-        external
+        public
         view
         returns (uint256 xRead, uint256 quoteRead)
     {
@@ -120,18 +170,28 @@ contract MarginaliaPricer {
 
     /// @notice The settlement price from a call's observations (at least one, in posting order).
     /// @param buy true for a BUY call: the adverse extreme is then the minimum, else the maximum
-    function settlePrice(T.Venue memory v, bool buy, T.Observation[] memory obs) external pure returns (uint256) {
+    function settlePrice(T.Venue memory v, bool buy, T.Observation[] memory obs)
+        external
+        pure
+        returns (uint256)
+    {
         uint256 n = obs.length;
         if (n == 0) revert Unsupported();
         uint256 x;
         if (v.kind == T.VenueKind.UniV4) {
             x = obs[0].xRead;
-            for (uint256 i = 1; i < n; ++i) x = _adverse(x, obs[i].xRead, buy);
+            for (uint256 i = 1; i < n; ++i) {
+                x = _adverse(x, obs[i].xRead, buy);
+            }
         } else {
-            x = twap(v.kind, v.xIsToken0, obs[0].xRead, obs[0].timestamp, obs[n - 1].xRead, obs[n - 1].timestamp);
+            x = twap(
+                v.kind, v.xIsToken0, obs[0].xRead, obs[0].timestamp, obs[n - 1].xRead, obs[n - 1].timestamp
+            );
         }
         uint256 q = obs[0].quoteRead;
-        for (uint256 i = 1; i < n; ++i) q = _adverse(q, obs[i].quoteRead, buy);
+        for (uint256 i = 1; i < n; ++i) {
+            q = _adverse(q, obs[i].quoteRead, buy);
+        }
         return FullMath.mulDiv(x, q, 1e18);
     }
 
@@ -166,6 +226,7 @@ contract MarginaliaPricer {
     function _spotInQuote(IPoolManager manager, T.Venue memory v) private view returns (uint256) {
         address ref = address(uint160(uint256(v.ref)));
         if (v.kind == T.VenueKind.UniV4) {
+            if (manager.getLiquidity(PoolId.wrap(v.ref)) == 0) revert EmptyPool();
             (uint160 sqrtP,,,) = manager.getSlot0(PoolId.wrap(v.ref));
             return fromSqrt(sqrtP, v.xIsToken0);
         }
@@ -186,6 +247,7 @@ contract MarginaliaPricer {
         if (quote == imd) return 1e18;
         if (quote == address(0) || quote == WETH) {
             if (block.chainid != 1) revert QuoteNotPriceable();
+            if (manager.getLiquidity(PoolId.wrap(HUB_POOL_ID)) == 0) revert EmptyPool();
             (uint160 sqrtP,,,) = manager.getSlot0(PoolId.wrap(HUB_POOL_ID));
             return fromSqrt(sqrtP, true); // native ETH is token0 of the hub
         }

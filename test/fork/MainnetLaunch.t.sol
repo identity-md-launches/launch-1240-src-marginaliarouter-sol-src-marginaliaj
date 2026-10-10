@@ -48,10 +48,21 @@ contract MainnetLaunchTest is Test {
     uint256 launchGas;
 
     function setUp() public {
-        vm.createSelectFork(vm.envString("MAINNET_RPC_URL"));
+        string memory rpc = vm.envOr("MAINNET_RPC_URL", string(""));
+        if (bytes(rpc).length == 0) {
+            vm.skip(true);
+            return;
+        }
+        vm.createSelectFork(rpc);
         // A derived test address must not land on a live mainnet contract (makeAddr("alice") does).
         assertEq(alice.code.length, 0, "alice must be an EOA on the fork");
         assertEq(requester.code.length, 0, "requester must be an EOA on the fork");
+    }
+
+    function _checkpoint(T.NoteParams memory p, PoolKey memory venueKey) internal {
+        router.checkpointVenue(p, venueKey);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.roll(vm.getBlockNumber() + 300);
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {
@@ -68,7 +79,9 @@ contract MainnetLaunchTest is Test {
         bytes32 hash = keccak256(hookCode);
         for (uint256 i = 1; i < 500_000; ++i) {
             address predicted = address(
-                uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(FACTORY), bytes32(i), hash))))
+                uint160(
+                    uint256(keccak256(abi.encodePacked(bytes1(0xff), address(FACTORY), bytes32(i), hash)))
+                )
             );
             if (HookFlags.matches(predicted, HookFlags.MARGINALIA)) return bytes32(i);
         }
@@ -83,8 +96,9 @@ contract MainnetLaunchTest is Test {
         vm.etch(MarginaliaImpls.PRICER, address(new MarginaliaPricer()).code);
         bytes memory tokenCode = type(Marginalia).creationCode;
         address predictedToken = FACTORY.predictToken(LAUNCH_NUMBER, tokenCode);
-        bytes memory hookCode =
-            abi.encodePacked(type(MarginaliaHook).creationCode, abi.encode(PM, predictedToken, address(FACTORY)));
+        bytes memory hookCode = abi.encodePacked(
+            type(MarginaliaHook).creationCode, abi.encode(PM, predictedToken, address(FACTORY))
+        );
         bytes32 salt = _mine(hookCode);
 
         bool margIs0 = predictedToken < IMD;
@@ -182,18 +196,22 @@ contract MainnetLaunchTest is Test {
         deal(IMD, alice, 1000 ether);
         vm.startPrank(alice);
         IERC20(IMD).approve(address(router), type(uint256).max);
-        PoolKey memory hub = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
+        PoolKey memory hub =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
         assertEq(PoolId.unwrap(hub.toId()), MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), "hub key");
         MarginaliaRouter.XTrade memory x =
             MarginaliaRouter.XTrade(router.X_V4(), hub, false, address(0), IMD, 10 ether, 1); // sell IMD for ETH
         T.NoteParams memory p;
         p.x = IMD;
-        p.venue = T.Venue(T.VenueKind.UniV4, MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), address(0), false);
+        p.venue = T.Venue(
+            T.VenueKind.UniV4, MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), address(0), false
+        );
         p.side = T.Side.Sell;
         p.targetBps = 7000;
         p.horizonDays = 14;
         p.class = uint8(T.Class.Declared);
         p.text = "IMD -30% in 14d: launch-night sells into a thin hub";
+        _checkpoint(p, hub);
         uint256 ethBefore = alice.balance;
         router.tradeAndNote(x, p, hub, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
@@ -215,11 +233,13 @@ contract MainnetLaunchTest is Test {
     address constant LINK = 0x514910771AF9Ca656af840dff83E8264EcF986CA;
     address constant UNI = 0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984;
 
-    function _xNote(address xToken, T.Venue memory venue, uint32 targetBps, uint16 horizon, string memory text)
-        internal
-        pure
-        returns (T.NoteParams memory p)
-    {
+    function _xNote(
+        address xToken,
+        T.Venue memory venue,
+        uint32 targetBps,
+        uint16 horizon,
+        string memory text
+    ) internal pure returns (T.NoteParams memory p) {
         p.x = xToken;
         p.venue = venue;
         p.side = T.Side.Buy;
@@ -239,7 +259,8 @@ contract MainnetLaunchTest is Test {
         IERC20(IMD).approve(address(router), type(uint256).max);
         IERC20(WETH).approve(address(router), type(uint256).max);
         PoolKey memory noKey;
-        MarginaliaRouter.XTrade memory x = MarginaliaRouter.XTrade(router.X_V3(), noKey, false, v3Pool, WETH, 1 ether, 1);
+        MarginaliaRouter.XTrade memory x =
+            MarginaliaRouter.XTrade(router.X_V3(), noKey, false, v3Pool, WETH, 1 ether, 1);
         T.NoteParams memory p = _xNote(
             LINK,
             T.Venue(T.VenueKind.UniV3, bytes32(uint256(uint160(v3Pool))), WETH, LINK < WETH),
@@ -247,6 +268,7 @@ contract MainnetLaunchTest is Test {
             30,
             "LINK 1.5x in 30d: CCIP volume"
         );
+        _checkpoint(p, noKey);
         uint256 linkBefore = IERC20(LINK).balanceOf(alice);
         router.tradeAndNote(x, p, noKey, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
@@ -295,10 +317,16 @@ contract MainnetLaunchTest is Test {
         IERC20(IMD).approve(address(router), type(uint256).max);
         IERC20(WETH).approve(address(router), type(uint256).max);
         PoolKey memory noKey;
-        MarginaliaRouter.XTrade memory x = MarginaliaRouter.XTrade(router.X_V2(), noKey, false, pair, WETH, 1 ether, 1);
+        MarginaliaRouter.XTrade memory x =
+            MarginaliaRouter.XTrade(router.X_V2(), noKey, false, pair, WETH, 1 ether, 1);
         T.NoteParams memory p = _xNote(
-            UNI, T.Venue(T.VenueKind.UniV2, bytes32(uint256(uint160(pair))), WETH, UNI < WETH), 12_000, 14, "UNI +20% in 14d: fee switch"
+            UNI,
+            T.Venue(T.VenueKind.UniV2, bytes32(uint256(uint160(pair))), WETH, UNI < WETH),
+            12_000,
+            14,
+            "UNI +20% in 14d: fee switch"
         );
+        _checkpoint(p, noKey);
         uint256 uniBefore = IERC20(UNI).balanceOf(alice);
         router.tradeAndNote(x, p, noKey, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
@@ -323,13 +351,17 @@ contract MainnetLaunchTest is Test {
         IERC20(IMD).approve(address(router), type(uint256).max);
         T.NoteParams memory p;
         p.x = IMD;
-        p.venue = T.Venue(T.VenueKind.UniV4, MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), address(0), false);
-        PoolKey memory hubKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
+        p.venue = T.Venue(
+            T.VenueKind.UniV4, MarginaliaPricer(MarginaliaImpls.PRICER).HUB_POOL_ID(), address(0), false
+        );
+        PoolKey memory hubKey =
+            PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
         p.side = T.Side.Buy;
         p.targetBps = 15_000;
         p.horizonDays = 30;
         p.class = uint8(T.Class.Declared);
         p.text = "IMD 1.5x in 30d: the hackathon launches are IMD-paired and every note here is an IMD buy";
+        _checkpoint(p, hubKey);
         uint256 received = router.note(p, hubKey, 20 ether, 1, block.timestamp + 1);
         vm.stopPrank();
         bytes32 id = bytes32(hook.noteCount());
@@ -339,7 +371,10 @@ contract MainnetLaunchTest is Test {
         assertApproxEqRel(n.postPrice, 1e18, 0.01e18); // IMD priced in IMD through the hub ≈ 1
         assertGt(received, 0);
         assertGt(n.deposit, 0);
-        assertEq(hook.refundPool(hook.today()) + hook.leaderboardPool(hook.week()) + hook.thesisPool(hook.week()), hook.STAMP());
+        assertEq(
+            hook.refundPool(hook.today()) + hook.leaderboardPool(hook.week()) + hook.thesisPool(hook.week()),
+            hook.STAMP()
+        );
         emit log_named_uint("MARG received for 20 IMD", received);
         emit log_named_uint("deposit (MARG)", n.deposit);
         emit log_named_uint("post price of IMD in IMD (1e18)", n.postPrice);
