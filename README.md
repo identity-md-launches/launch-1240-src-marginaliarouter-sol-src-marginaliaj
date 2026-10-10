@@ -16,8 +16,7 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
 | `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pools daily. No withdraw; refuses ETH. |
-| `MarginaliaMath` | Stateless score arithmetic (log2, sqrt, difficulty) the hook calls by staticcall; kept out of the hook for code size. |
-| `MarginaliaPricer` | Stateless price reads and the settlement rule: post-time spot; observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. One honest observation pins the extreme, so a pump must be held for the whole ≥1 h span. |
+| `MarginaliaPricer` | Stateless, ownerless helper the hook calls by staticcall (kept out of the hook for code size): score arithmetic (log2, sqrt, difficulty), price reads and the settlement rule: post-time spot; observation reads (v3 tick cumulative, v2 price cumulative, v4 spot, the ETH→IMD hub spot); settle price = TWAP first→last on v3/v2, the observation least favourable to the call on v4 and on the hub leg. One honest observation pins the extreme, so a pump must be held for the whole ≥1 h span. |
 
 ## How the pot pays
 
@@ -36,8 +35,8 @@ except through the score, which is difficulty-weighted, netted against wrong cal
 
 1. Contracts-only launch: `MarginaliaRouter`, `MarginaliaJudge`, `MarginaliaTreasury` implementations
    (ownerless; they lock themselves in their constructors so only clones can be initialised, once, by the hook)
-   plus the stateless `MarginaliaMath` and `MarginaliaPricer`.
-2. Set the five addresses in `src/MarginaliaImpls.sol`.
+   plus the stateless `MarginaliaPricer`.
+2. Set the four addresses in `src/MarginaliaImpls.sol`.
 3. Hook launch (`launch.json`): the factory deploys the token and the hook; the hook's constructor clones
    the three implementations and initialises each with itself in the same transaction.
 

@@ -22,7 +22,6 @@ import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
 import {HookFlags} from "../../src/HookFlags.sol";
 import {MarginaliaTypes as T} from "../../src/MarginaliaTypes.sol";
 import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
-import {MarginaliaMath} from "../../src/MarginaliaMath.sol";
 import {MarginaliaPricer} from "../../src/MarginaliaPricer.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {IIntake} from "../../src/interfaces/IIntake.sol";
@@ -158,7 +157,6 @@ abstract contract Fixture is Test {
         vm.etch(MarginaliaImpls.ROUTER_IMPL, address(new MarginaliaRouter()).code);
         vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
         vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
-        vm.etch(MarginaliaImpls.MATH, address(new MarginaliaMath()).code);
         vm.etch(MarginaliaImpls.PRICER, address(new MarginaliaPricer()).code);
     }
 

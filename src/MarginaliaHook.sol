@@ -23,7 +23,6 @@ import {MarginaliaTreasury} from "./MarginaliaTreasury.sol";
 import {MarginaliaRouter} from "./MarginaliaRouter.sol";
 import {MarginaliaJudge} from "./MarginaliaJudge.sol";
 import {MarginaliaImpls} from "./MarginaliaImpls.sol";
-import {MarginaliaMath} from "./MarginaliaMath.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /// @title Marginalia: notes in the margin of every trade
@@ -195,8 +194,7 @@ contract MarginaliaHook is IUnlockCallback {
         // Companions are EIP-1167 clones of audited implementations, initialised here and never again.
         if (
             MarginaliaImpls.TREASURY_IMPL.code.length == 0 || MarginaliaImpls.ROUTER_IMPL.code.length == 0
-                || MarginaliaImpls.JUDGE_IMPL.code.length == 0 || MarginaliaImpls.MATH.code.length == 0
-                || MarginaliaImpls.PRICER.code.length == 0
+                || MarginaliaImpls.JUDGE_IMPL.code.length == 0 || MarginaliaImpls.PRICER.code.length == 0
         ) revert InvalidUnlock();
         MarginaliaTreasury t = MarginaliaTreasury(payable(Clones.clone(MarginaliaImpls.TREASURY_IMPL)));
         t.init(address(this));
@@ -600,10 +598,10 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ score
 
-    /// @dev log2(claimed multiple) x sqrt(30 / horizon) x mcap tier, scaled 1e4 (MarginaliaMath).
+    /// @dev log2(claimed multiple) x sqrt(30 / horizon) x mcap tier, scaled 1e4 (MarginaliaPricer).
     function _difficulty(T.Note storage n) private view returns (uint256) {
         uint256 mcap = FullMath.mulDiv(n.postPrice, IERC20(n.x).totalSupply(), 1e18);
-        return MarginaliaMath(MarginaliaImpls.MATH).difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
+        return _pricer().difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
     }
 
     // ------------------------------------------------------------------ pot and judging

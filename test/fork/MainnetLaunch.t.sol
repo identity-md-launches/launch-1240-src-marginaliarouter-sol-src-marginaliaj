@@ -21,7 +21,6 @@ import {ILaunchFactory} from "../../src/interfaces/ILaunchFactory.sol";
 import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
 import {MarginaliaTreasury} from "../../src/MarginaliaTreasury.sol";
 import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
-import {MarginaliaMath} from "../../src/MarginaliaMath.sol";
 import {MarginaliaPricer} from "../../src/MarginaliaPricer.sol";
 
 /// @notice The rehearsal: the real IMD LaunchFactory on a mainnet fork, impersonating its launch wallet,
@@ -81,7 +80,6 @@ contract MainnetLaunchTest is Test {
         vm.etch(MarginaliaImpls.ROUTER_IMPL, address(new MarginaliaRouter()).code);
         vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
         vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
-        vm.etch(MarginaliaImpls.MATH, address(new MarginaliaMath()).code);
         vm.etch(MarginaliaImpls.PRICER, address(new MarginaliaPricer()).code);
         bytes memory tokenCode = type(Marginalia).creationCode;
         address predictedToken = FACTORY.predictToken(LAUNCH_NUMBER, tokenCode);
