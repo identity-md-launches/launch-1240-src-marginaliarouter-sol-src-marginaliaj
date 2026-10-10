@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import {Vm} from "forge-std/Vm.sol";
 import {Fixture} from "./helpers/Fixture.sol";
 import {MarginaliaHook} from "../src/MarginaliaHook.sol";
 import {MarginaliaTypes as T} from "../src/MarginaliaTypes.sol";
-import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @title The revised hold rule and observation-replacement rule at their exact boundaries.
-/// @dev The second review round made a SELL call tolerant of balance growth up to the larger of 10% of the
-/// post balance and the deposit's worth of X, and let a more adverse reading replace a slot inside the block
-/// gap or at the series cap. These tests pin the one-wei edges of both rules and the paths they refuse.
+/// @title The hold rule and observation-replacement rule at their exact boundaries.
+/// @dev After the third review round a SELL call has no hold rule at all (finding 80c42ce7: any balance-growth
+/// rule lets a stranger void a correct call with a gift), so it settles on price alone and its balance is
+/// never an adverse reading; a BUY call must keep its post balance to the wei, and an unreadable balance counts
+/// as not held. A more adverse reading replaces a slot inside the block gap or at the series cap. These tests
+/// pin the one-wei edges of both rules and the paths they refuse.
 contract HoldRuleTest is Fixture {
     function setUp() public {
         _setup();
@@ -40,49 +43,56 @@ contract HoldRuleTest is Fixture {
         assertLt(hook.margPriceInImd(), 0.8e18);
     }
 
-    /// @dev The documented tolerance: the larger of SELL_HOLD_TOLERANCE_BPS of the post balance and the
-    /// deposit's worth of X at the post price.
-    function _tolerance(bytes32 id) internal view returns (uint256) {
-        T.Note memory n = hook.noteOf(id);
-        uint256 tol = n.postBalance * hook.SELL_HOLD_TOLERANCE_BPS() / 10_000;
-        uint256 worth = FullMath.mulDiv(hook.DEPOSIT(), 1e18, n.postPrice);
-        return worth > tol ? worth : tol;
-    }
+    // ---------------------------------------------------------------- SELL: no hold rule in either direction
 
-    // ---------------------------------------------------------------- SELL tolerance edges
-
-    function testSellCallHoldsExactlyAtTheTolerance() public {
+    function testASellAuthorWhoBuysBackTheirWholePostBalanceIsStillRight() public {
+        // the author's own buy-back, not a stranger's gift: the rule is gone for everyone, not only for gifts
         bytes32 id = _sellCall();
-        uint256 tol = _tolerance(id);
-        assertEq(tol, hook.noteOf(id).postBalance / 10, "a well-funded author is bound by the 10% rule");
-        token.transfer(alice, tol);
+        uint256 post = hook.noteOf(id).postBalance;
+        _buy(alice, 20_000 ether);
+        assertGt(token.balanceOf(alice), post + post / 10, "the buy-back is well past the old 10% line");
         _observeThree(id);
         hook.settle(id);
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Right));
         assertEq(_rec(alice).broken, 0);
-        assertGt(hook.noteOf(id).deposit, 0, "a held call keeps its deposit claimable");
+        assertGt(hook.noteOf(id).deposit, 0, "a SELL call that was right keeps its deposit claimable");
     }
 
-    function testSellCallBreaksOneWeiPastTheTolerance() public {
+    function testASellAuthorMayDumpTheirWholeRemainingBalance() public {
+        // no rule downwards either: selling the rest of X is consistent with a SELL call
         bytes32 id = _sellCall();
-        token.transfer(alice, _tolerance(id) + 1);
+        _sell(alice, token.balanceOf(alice));
+        assertEq(token.balanceOf(alice), 0);
         _observeThree(id);
         hook.settle(id);
-        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidSold));
-        assertEq(_rec(alice).broken, 1);
-        assertEq(hook.noteOf(id).deposit, 0, "a broken call forfeits its deposit");
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Right));
+        assertEq(_rec(alice).broken, 0);
     }
 
-    function testASingleObservationPastTheToleranceVoidsTheCall() public {
-        // the balance is back under the line by the next readings; one breach in the series is enough
-        bytes32 id = _sellCall();
-        uint256 end = hook.horizonEnd(id);
-        uint256 over = _tolerance(id) + 1;
-        token.transfer(alice, over);
-        vm.warp(end);
-        hook.observe(id);
+    function testAWrongSellCallForfeitsWhateverTheBalanceDid() public {
+        // price alone decides: flat market, so -10% did not happen, and a gift changes nothing about that
         vm.prank(alice);
-        token.transfer(address(this), over);
+        router.sellWithNote(_margNote(T.Side.Sell, 9000, 1, "-10%"), key, 2 ether, 1, block.timestamp + 1);
+        bytes32 id = bytes32(hook.noteCount());
+        token.transfer(alice, 1_000_000 ether);
+        _observeThree(id);
+        hook.settle(id);
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Wrong));
+        assertEq(_rec(alice).broken, 0, "a wrong SELL call is wrong, never broken");
+        assertEq(hook.noteOf(id).deposit, 0);
+    }
+
+    function testASellCallWithAnUnreadableBalanceStillSettlesOnPrice() public {
+        // the sentinel (balanceOf reverted) voids a BUY call; a SELL call has no balance to keep
+        bytes32 id = _sellCall();
+        vm.mockCallRevert(address(token), abi.encodeWithSelector(IERC20.balanceOf.selector, alice), "");
+        uint256 end = hook.horizonEnd(id);
+        vm.warp(end);
+        vm.recordLogs();
+        hook.observe(id);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        (,,, uint256 balance) = abi.decode(logs[logs.length - 1].data, (uint64, uint256, uint256, uint256));
+        assertEq(balance, type(uint256).max, "the unverifiable sentinel is on record");
         vm.warp(end + 30 minutes);
         vm.roll(vm.getBlockNumber() + 150);
         hook.observe(id);
@@ -91,27 +101,39 @@ contract HoldRuleTest is Fixture {
         hook.observe(id);
         vm.warp(end + hook.SETTLE_WINDOW() + 1);
         hook.settle(id);
-        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidSold));
-    }
-
-    function testSmallAuthorIsBoundByTheDepositsWorthNotTenPercent() public {
-        // alice keeps 3 MARG: after a 2 MARG sell her post balance is ~1 MARG, so 10% of it is below the
-        // deposit's worth (0.5 IMD of MARG), and the larger bound rules
-        uint256 surplus = token.balanceOf(alice) - 3 ether;
-        vm.prank(alice);
-        token.transfer(carol, surplus);
-        bytes32 id = _sellCall();
-        assertLe(hook.noteOf(id).postBalance, 1 ether);
-        T.Note memory n = hook.noteOf(id);
-        uint256 worth = FullMath.mulDiv(hook.DEPOSIT(), 1e18, n.postPrice);
-        assertGt(worth, n.postBalance / 10, "the deposit's worth should dominate for a small holder");
-        assertEq(_tolerance(id), worth);
-        // a transfer past 10% of her balance but inside the deposit's worth is still held
-        token.transfer(alice, worth);
-        _observeThree(id);
-        hook.settle(id);
+        vm.clearMockedCalls();
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Right));
         assertEq(_rec(alice).broken, 0);
+    }
+
+    function testABuyCallWithAnUnreadableBalanceIsVoidSold() public {
+        // the same sentinel against a BUY call that is right on price: not held
+        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11_000, 1, "+10%"), 10 ether);
+        _buy(bob, 1_500_000 ether);
+        vm.mockCallRevert(address(token), abi.encodeWithSelector(IERC20.balanceOf.selector, alice), "");
+        _observeThree(id);
+        hook.settle(id);
+        vm.clearMockedCalls();
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidSold));
+        assertEq(_rec(alice).broken, 1);
+    }
+
+    function testASellCallsBalanceIsNeverAnAdverseReading() public {
+        // inside the block gap only a worse PRICE replaces the slot for a SELL call; a balance jump of any
+        // size is not more adverse and is refused, where the same jump used to void the call
+        bytes32 id = _sellCall();
+        uint256 end = hook.horizonEnd(id);
+        vm.warp(end);
+        hook.observe(id);
+        vm.roll(vm.getBlockNumber() + 1);
+        token.transfer(alice, 1_000_000 ether);
+        vm.expectRevert(MarginaliaHook.ObservationTooSoon.selector);
+        hook.observe(id);
+        // a higher price IS more adverse to a SELL call and gets in, in the very same block
+        _buy(bob, 100_000 ether);
+        vm.expectEmit(true, false, false, false, address(hook));
+        emit MarginaliaHook.Observed(id, 0, 0, 0, 0);
+        hook.observe(id);
     }
 
     function testBuyCallHasNoToleranceDownwards() public {

@@ -160,13 +160,11 @@ contract PricerPropertiesTest is Test {
         assertLt(l1, (floor + 1) * 10_000);
     }
 
-    /// @dev x == 2 is excluded on purpose: the reseeded Babylonian start (`x / 2 + 1`) equals x there, the
-    /// loop never runs and sqrt(2) returns 2. That is reported in .imd-findings.json with a proof, not
-    /// asserted here; it is unreachable through `difficulty`, whose argument is at least 30e8 / 90.
+    /// @dev The whole domain, x == 2 included: the reseeded Babylonian start (`x / 2 + 1`) equals x there, so
+    /// the loop would not run and sqrt(2) returned 2 until the third review round (finding 4e3977e5) pinned
+    /// 1..3 to 1 before the loop.
     /// forge-config: default.fuzz.runs = 1000
     function testFuzzSqrtIsTheIntegerFloor(uint256 x) public view {
-        x = bound(x, 0, type(uint256).max);
-        if (x == 2) x = 3;
         uint256 y = pricer.sqrt(x);
         assertLe(y, type(uint128).max);
         assertLe(y * y, x, "sqrt above the root");
@@ -176,16 +174,20 @@ contract PricerPropertiesTest is Test {
     function testSqrtPins() public view {
         assertEq(pricer.sqrt(0), 0);
         assertEq(pricer.sqrt(1), 1);
+        assertEq(pricer.sqrt(2), 1, "the seed-equals-x case floors to 1");
         assertEq(pricer.sqrt(3), 1);
         assertEq(pricer.sqrt(4), 2);
+        assertEq(pricer.sqrt(5), 2);
+        assertEq(pricer.sqrt(8), 2);
+        assertEq(pricer.sqrt(9), 3);
         assertEq(pricer.sqrt(3_000_000_000), 54_772);
         // the reseed's reason: the top of the range no longer overflows
         assertEq(pricer.sqrt(type(uint256).max), type(uint128).max);
         assertEq(pricer.sqrt(type(uint256).max - 1), type(uint128).max);
     }
 
-    /// @dev Every argument `difficulty` can hand to sqrt (30e8 / h for h in 1..90) is rooted exactly, so the
-    /// sqrt(2) defect never reaches a score.
+    /// @dev Every argument `difficulty` can hand to sqrt (30e8 / h for h in 1..90) is rooted exactly: the
+    /// small-input seed case never reached a score even before it was fixed.
     function testSqrtIsExactOnEveryHorizonDifficultyUses() public view {
         for (uint256 h = 1; h <= 90; ++h) {
             uint256 x = FullMath.mulDiv(30, 1e8, h);
