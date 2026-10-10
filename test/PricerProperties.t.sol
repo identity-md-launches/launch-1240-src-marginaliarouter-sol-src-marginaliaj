@@ -23,6 +23,31 @@ contract SlotManagerMock {
     }
 }
 
+/// @dev A v2 pair frozen at fixed reserves whose cumulatives the pricer extrapolates from `blockTimestampLast`.
+contract V2PairMock {
+    uint112 private r0;
+    uint112 private r1;
+    uint32 private ts;
+
+    constructor(uint112 r0_, uint112 r1_) {
+        r0 = r0_;
+        r1 = r1_;
+        ts = uint32(block.timestamp - 10);
+    }
+
+    function getReserves() external view returns (uint112, uint112, uint32) {
+        return (r0, r1, ts);
+    }
+
+    function price0CumulativeLast() external pure returns (uint256) {
+        return 0;
+    }
+
+    function price1CumulativeLast() external pure returns (uint256) {
+        return 0;
+    }
+}
+
 /// @dev Properties of the stateless pricer at the edges of its inputs: the score arithmetic, the
 /// settlement rule over random observation series, and the posting window's exact boundaries.
 contract PricerPropertiesTest is Test {
@@ -135,9 +160,13 @@ contract PricerPropertiesTest is Test {
         assertLt(l1, (floor + 1) * 10_000);
     }
 
+    /// @dev x == 2 is excluded on purpose: the reseeded Babylonian start (`x / 2 + 1`) equals x there, the
+    /// loop never runs and sqrt(2) returns 2. That is reported in .imd-findings.json with a proof, not
+    /// asserted here; it is unreachable through `difficulty`, whose argument is at least 30e8 / 90.
     /// forge-config: default.fuzz.runs = 1000
     function testFuzzSqrtIsTheIntegerFloor(uint256 x) public view {
-        x = bound(x, 0, type(uint256).max - 1);
+        x = bound(x, 0, type(uint256).max);
+        if (x == 2) x = 3;
         uint256 y = pricer.sqrt(x);
         assertLe(y, type(uint128).max);
         assertLe(y * y, x, "sqrt above the root");
@@ -150,14 +179,30 @@ contract PricerPropertiesTest is Test {
         assertEq(pricer.sqrt(3), 1);
         assertEq(pricer.sqrt(4), 2);
         assertEq(pricer.sqrt(3_000_000_000), 54_772);
+        // the reseed's reason: the top of the range no longer overflows
+        assertEq(pricer.sqrt(type(uint256).max), type(uint128).max);
+        assertEq(pricer.sqrt(type(uint256).max - 1), type(uint128).max);
+    }
+
+    /// @dev Every argument `difficulty` can hand to sqrt (30e8 / h for h in 1..90) is rooted exactly, so the
+    /// sqrt(2) defect never reaches a score.
+    function testSqrtIsExactOnEveryHorizonDifficultyUses() public view {
+        for (uint256 h = 1; h <= 90; ++h) {
+            uint256 x = FullMath.mulDiv(30, 1e8, h);
+            uint256 y = pricer.sqrt(x);
+            assertLe(y * y, x);
+            assertGt((y + 1) * (y + 1), x);
+        }
     }
 
     // ------------------------------------------------------------------ fromSqrt
 
+    /// @dev Below ~2^96 / 1e9 the token0 price rounds to zero and the pricer refuses it (tested apart); the
+    /// monotonicity property holds over everything it does price.
     /// forge-config: default.fuzz.runs = 1000
     function testFuzzFromSqrtIsMonotoneAndInverts(uint160 s1, uint160 s2) public view {
-        s1 = uint160(bound(s1, TickMath.MIN_SQRT_PRICE, TickMath.MAX_SQRT_PRICE));
-        s2 = uint160(bound(s2, TickMath.MIN_SQRT_PRICE, TickMath.MAX_SQRT_PRICE));
+        s1 = uint160(bound(s1, 1e20, TickMath.MAX_SQRT_PRICE));
+        s2 = uint160(bound(s2, 1e20, TickMath.MAX_SQRT_PRICE));
         if (s1 > s2) (s1, s2) = (s2, s1);
         uint256 p1 = pricer.fromSqrt(s1, true);
         uint256 p2 = pricer.fromSqrt(s2, true);
@@ -184,6 +229,37 @@ contract PricerPropertiesTest is Test {
         assertEq(pricer.fromSqrt(uint160(2 << 96), false), 0.25e18);
     }
 
+    /// @dev The zero-price refusal is exact in both orientations: the last sqrt price that rounds to zero
+    /// reverts and the first that does not prices. Found by bisection against the pricer itself.
+    function testFromSqrtZeroThresholdIsSharpInBothOrientations() public {
+        // token0 orientation: price = s^2 / 2^192 × 1e18 rounds to zero just below 2^96 / 1e9
+        uint160 lo = 1;
+        uint160 hi = 1e20;
+        while (hi - lo > 1) {
+            uint160 mid = lo + (hi - lo) / 2;
+            (bool ok,) = address(pricer).staticcall(abi.encodeCall(pricer.fromSqrt, (mid, true)));
+            if (ok) hi = mid;
+            else lo = mid;
+        }
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.fromSqrt(lo, true);
+        assertEq(pricer.fromSqrt(hi, true), 1, "the first priceable reading is exactly one wei of quote");
+        assertApproxEqRel(uint256(hi), uint256(2 ** 96) / 1e9, 1e12);
+        // token1 orientation: the inverse of a huge token0 price rounds to zero just above 2^96 × 1e9
+        lo = 1e20;
+        hi = TickMath.MAX_SQRT_PRICE;
+        while (hi - lo > 1) {
+            uint160 mid = lo + (hi - lo) / 2;
+            (bool ok,) = address(pricer).staticcall(abi.encodeCall(pricer.fromSqrt, (mid, false)));
+            if (ok) lo = mid;
+            else hi = mid;
+        }
+        assertEq(pricer.fromSqrt(lo, false), 1);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.fromSqrt(hi, false);
+        assertApproxEqRel(uint256(hi), uint256(2 ** 96) * 1e9, 1e12);
+    }
+
     // ------------------------------------------------------------------ settlement
 
     function _series(uint256[16] memory xs, uint256[16] memory qs, uint8 n)
@@ -202,7 +278,7 @@ contract PricerPropertiesTest is Test {
         uint256[16] memory xs,
         uint256[16] memory qs,
         uint8 n
-    ) public view {
+    ) public {
         n = uint8(bound(n, 1, 16));
         uint256 xMin = type(uint256).max;
         uint256 xMax;
@@ -218,16 +294,35 @@ contract PricerPropertiesTest is Test {
         }
         T.Observation[] memory obs = _series(xs, qs, n);
         T.Venue memory v = T.Venue(T.VenueKind.UniV4, bytes32(0), address(0), true);
-        assertEq(
-            pricer.settlePrice(v, true, obs), FullMath.mulDiv(xMin, qMin, 1e18), "BUY is not the minimum"
-        );
-        assertEq(
-            pricer.settlePrice(v, false, obs), FullMath.mulDiv(xMax, qMax, 1e18), "SELL is not the maximum"
-        );
+        // an extreme that rounds below one wei of IMD is refused rather than settled at zero
+        uint256 buyPrice = FullMath.mulDiv(xMin, qMin, 1e18);
+        if (buyPrice == 0) vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        uint256 got = pricer.settlePrice(v, true, obs);
+        if (buyPrice != 0) assertEq(got, buyPrice, "BUY is not the minimum");
+        uint256 sellPrice = FullMath.mulDiv(xMax, qMax, 1e18);
+        if (sellPrice == 0) vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        got = pricer.settlePrice(v, false, obs);
+        if (sellPrice != 0) assertEq(got, sellPrice, "SELL is not the maximum");
+    }
+
+    /// @dev A v4 series whose adverse extreme is dust is no data, not a free settlement: a BUY call cannot be
+    /// right against a zero and a SELL call cannot be right because of one.
+    function testV4SeriesWithADustExtremeIsRefusedNotSettledAtZero() public {
+        T.Venue memory v = T.Venue(T.VenueKind.UniV4, bytes32(0), address(0), true);
+        T.Observation[] memory obs = new T.Observation[](2);
+        obs[0] = T.Observation(0, 0, 1e18, 1e18, 0);
+        obs[1] = T.Observation(600, 50, 1, 1, 0); // one reading at dust on both legs
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.settlePrice(v, true, obs);
+        assertEq(pricer.settlePrice(v, false, obs), 1e18, "the SELL maximum is still the honest reading");
+        obs[0] = T.Observation(0, 0, 1, 1, 0);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.settlePrice(v, false, obs);
     }
 
     /// @dev One honest observation pins the extreme whatever else is appended: the BUY price can only fall
-    /// and the SELL price can only rise as the series grows.
+    /// and the SELL price can only rise as the series grows. Readings are kept above the dust the pricer
+    /// refuses so both series price.
     /// forge-config: default.fuzz.runs = 1000
     function testFuzzAppendingAnObservationNeverHelpsTheCall(
         uint256[16] memory xs,
@@ -236,8 +331,8 @@ contract PricerPropertiesTest is Test {
     ) public view {
         n = uint8(bound(n, 2, 16));
         for (uint256 i; i < n; ++i) {
-            xs[i] = bound(xs[i], 1, 1e30);
-            qs[i] = bound(qs[i], 1, 1e30);
+            xs[i] = bound(xs[i], 1e9, 1e30);
+            qs[i] = bound(qs[i], 1e9, 1e30);
         }
         T.Observation[] memory longer = _series(xs, qs, n);
         T.Observation[] memory shorter = _series(xs, qs, n - 1);
@@ -277,10 +372,7 @@ contract PricerPropertiesTest is Test {
     }
 
     /// forge-config: default.fuzz.runs = 512
-    function testFuzzV2TwapOfAConstantRatioIsThatRatio(uint112 r0, uint112 r1, uint32 dt, bool x0)
-        public
-        view
-    {
+    function testFuzzV2TwapOfAConstantRatioIsThatRatio(uint112 r0, uint112 r1, uint32 dt, bool x0) public {
         r0 = uint112(bound(r0, 1, type(uint112).max));
         r1 = uint112(bound(r1, 1, type(uint112).max));
         dt = uint32(bound(dt, 1, 30 days));
@@ -290,9 +382,60 @@ contract PricerPropertiesTest is Test {
         unchecked {
             c2 = c1 + ratio * dt;
         }
-        uint256 got = pricer.twap(T.VenueKind.UniV2, x0, c1, 100, c2, 100 + dt);
         uint256 want = x0 ? FullMath.mulDiv(r1, 1e18, r0) : FullMath.mulDiv(r0, 1e18, r1);
-        assertApproxEqAbs(got, want, 1, "v2 TWAP of a flat ratio");
+        // a ratio below one wei of quote per 1e18 of X is refused, never averaged to zero
+        if (want == 0) vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        uint256 got = pricer.twap(T.VenueKind.UniV2, x0, c1, 100, c2, 100 + dt);
+        if (want != 0) assertApproxEqAbs(got, want, 1, "v2 TWAP of a flat ratio");
+    }
+
+    function testV2TwapAndSpotOfADustRatioAreRefused() public {
+        // reserves of 2^112 - 1 against 1: the price of token0 in token1 rounds to zero at 1e18 scale
+        uint256 dust = FullMath.mulDiv(1, 2 ** 112, type(uint112).max);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.twap(T.VenueKind.UniV2, true, 0, 0, dust * 600, 600);
+        // the same pair the other way round prices at ~2^112 × 1e18
+        uint256 c2 = FullMath.mulDiv(type(uint112).max, 2 ** 112, 1) * 600;
+        assertGt(pricer.twap(T.VenueKind.UniV2, false, 0, 0, c2, 600), 1e18);
+        V2PairMock pair = new V2PairMock(type(uint112).max, 1);
+        T.Venue memory v = T.Venue(T.VenueKind.UniV2, bytes32(uint256(uint160(address(pair)))), imd, true);
+        // the accumulator reading itself is fine (it is the cumulative, not a price) ...
+        (uint256 x,) = pricer.observe(manager, v, imd);
+        assertEq(x, dust * 10, "the extrapolated v2 cumulative");
+        // ... but a baseline from it is not: checkpoint, mature, and the TWAP of dust is refused
+        T.PriceWindow memory empty;
+        T.PriceWindow memory w = pricer.checkpoint(manager, v, imd, empty);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.postPrice(manager, v, imd, true, w);
+    }
+
+    /// @dev Both legs price but their product does not: the venue at one wei of ETH and ETH at one wei of
+    /// IMD give a post price of zero, which is refused rather than handed to the hook as a baseline.
+    function testPostPriceWhoseProductRoundsToZeroIsRefused() public {
+        uint160 tiny = uint160(1e20); // fromSqrt(tiny, true) == 1
+        assertEq(pricer.fromSqrt(tiny, true), 1);
+        state.setPool(POOL, tiny, 1 ether);
+        state.setPool(pricer.HUB_POOL_ID(), tiny, 1 ether);
+        T.Venue memory v = T.Venue(T.VenueKind.UniV4, POOL, address(0), true);
+        T.PriceWindow memory empty;
+        T.PriceWindow memory w = pricer.checkpoint(manager, v, imd, empty);
+        assertEq(w.xMin, 1);
+        assertEq(w.quoteMin, 1);
+        vm.warp(vm.getBlockTimestamp() + 1 hours);
+        vm.roll(vm.getBlockNumber() + 1);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.postPrice(manager, v, imd, true, w);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.postPrice(manager, v, imd, false, w);
+        // with the hub back at parity the BUY baseline (the window's quote maximum) prices at one wei,
+        // while the SELL baseline still holds the dust minimum and stays refused
+        state.setPool(pricer.HUB_POOL_ID(), uint160(1 << 96), 1 ether);
+        w = pricer.checkpoint(manager, v, imd, w);
+        assertEq(pricer.postPrice(manager, v, imd, true, w), 1);
+        vm.expectRevert(MarginaliaPricer.EmptyPool.selector);
+        pricer.postPrice(manager, v, imd, false, w);
     }
 
     function testSettlementRefusesAnEmptyOrUnspannedSeries() public {

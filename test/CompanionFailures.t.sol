@@ -227,8 +227,16 @@ contract JudgeHookMock {
         IERC20(imd).transfer(msg.sender, amount);
     }
 
+    /// @dev The most MARG one sale may absorb (the hook's slippage floor); zero means unlimited.
+    uint256 public maxSell;
+
+    function setMaxSell(uint256 m) external {
+        maxSell = m;
+    }
+
     function sellPotMarg(uint256 amount) external returns (uint256) {
         require(amount > 0 && amount <= potMarg, "PotTooSmall");
+        if (maxSell != 0 && amount > maxSell) revert("floor");
         potMarg -= amount;
         sells += 1;
         return amount * 2;
@@ -613,14 +621,114 @@ contract JudgeFailuresTest is Test {
         vm.warp(vm.getBlockTimestamp() + judge.ANSWER_DEADLINE());
         assertFalse(judge.weekClosed(99), "unanswered past the deadline but inside 28 days: still retriable");
         vm.warp(uint256(100) * 7 days + 28 days);
-        assertTrue(judge.weekClosed(99), "28 days after the week ends it closes");
-        // a judged week is never closed: it is paid instead
-        vm.warp(NOW);
+        // revision f0aea555: time alone never closes a week whose request the Intake could still deliver
+        assertFalse(judge.weekClosed(99), "28 days on, a deliverable request still holds the week open");
+        judge.abandonRequest(99);
+        assertTrue(judge.weekClosed(99), "abandoned and 28 days past the week's end: closed");
+        // the abandoned id can no longer land
+        OracleAttestation.Attestation memory a = _att(_ids(3));
+        (bool ok, bytes memory err) = intake.deliver(req, a, _sign(a));
+        assertFalse(ok);
+        assertEq(bytes4(err), MarginaliaJudge.UnknownRequest.selector);
+        // a retry reopens it, and a judged week is never closed: it is paid instead
+        bytes32 again = judge.requestJudging(99);
+        assertTrue(hook.lastRetry());
+        assertFalse(judge.weekClosed(99), "a fresh request reopened the week");
+        a = _att(_ids(3));
+        (ok,) = intake.deliver(again, a, _sign(a));
+        assertTrue(ok);
+        assertFalse(judge.weekClosed(99));
+        assertFalse(judge.weekClosed(99), "a judged week never closes");
+    }
+
+    // ---------------------------------------------------------------- abandonRequest
+
+    function testAbandonNeedsALiveRequestPastItsDeadline() public {
+        vm.expectRevert(MarginaliaJudge.UnknownRequest.selector);
+        judge.abandonRequest(99); // never requested
+        vm.expectRevert(MarginaliaJudge.UnknownRequest.selector);
+        judge.abandonRequest(98); // no theses, never requestable
+        bytes32 req = judge.requestJudging(99);
+        vm.expectRevert(MarginaliaJudge.AlreadyRequested.selector);
+        judge.abandonRequest(99); // the panel still has time
+        vm.warp(vm.getBlockTimestamp() + judge.ANSWER_DEADLINE() - 1);
+        vm.expectRevert(MarginaliaJudge.AlreadyRequested.selector);
+        judge.abandonRequest(99);
+        vm.warp(vm.getBlockTimestamp() + 1); // exactly the deadline: the request may be abandoned
+        vm.expectEmit(true, true, false, true, address(judge));
+        emit MarginaliaJudge.Abandoned(99, req);
+        vm.prank(makeAddr("anyone"));
+        judge.abandonRequest(99);
+        assertEq(judge.requestOf(99), req, "abandoning keeps the record of what was asked");
+        vm.expectRevert(MarginaliaJudge.UnknownRequest.selector);
+        judge.abandonRequest(99); // already abandoned
+    }
+
+    function testAJudgedWeekCannotBeAbandoned() public {
+        bytes32 req = judge.requestJudging(99);
         OracleAttestation.Attestation memory a = _att(_ids(3));
         (bool ok,) = intake.deliver(req, a, _sign(a));
         assertTrue(ok);
-        vm.warp(uint256(100) * 7 days + 28 days);
+        vm.warp(vm.getBlockTimestamp() + judge.ANSWER_DEADLINE() + 1);
+        // the delivery consumed the pending slot, so there is nothing to abandon and the week stays judged
+        vm.expectRevert(MarginaliaJudge.UnknownRequest.selector);
+        judge.abandonRequest(99);
+        assertTrue(judge.judgedSet(99));
         assertFalse(judge.weekClosed(99));
+    }
+
+    function testAbandonTakesNothingAndTheRetryDrawsAgain() public {
+        judge.requestJudging(99);
+        vm.warp(vm.getBlockTimestamp() + judge.ANSWER_DEADLINE());
+        uint256 judgeImd = imd.balanceOf(address(judge));
+        uint256 intakeImd = imd.balanceOf(address(intake));
+        judge.abandonRequest(99);
+        assertEq(imd.balanceOf(address(judge)), judgeImd, "abandoning moved IMD");
+        assertEq(imd.balanceOf(address(intake)), intakeImd, "abandoning refunded the Intake's price");
+        assertEq(hook.draws(), 1);
+        bytes32 again = judge.requestJudging(99);
+        assertEq(hook.draws(), 2, "the retry did not draw");
+        assertTrue(hook.lastRetry());
+        assertEq(judge.requestOf(99), again);
+        // the retried request is itself abandonable only after its own deadline
+        vm.expectRevert(MarginaliaJudge.AlreadyRequested.selector);
+        judge.abandonRequest(99);
+    }
+
+    // ---------------------------------------------------------------- convertForfeits tranches
+
+    function testConvertSellsTheLargestHalvingThePoolAbsorbs() public {
+        hook.setPotMarg(100 ether);
+        hook.setMaxSell(30 ether); // 100 and 50 are refused, 25 sells
+        assertEq(judge.convertForfeits(), 50 ether);
+        assertEq(hook.sells(), 1, "more than one tranche sold in one call");
+        assertEq(hook.potMarg(), 75 ether, "the rest of the pot stays for the next call");
+        // the next call takes the next tranche that fits, never the refused larger ones
+        assertEq(judge.convertForfeits(), 37.5 ether); // 75 refused, 37.5 refused, 18.75 sells
+        assertEq(hook.potMarg(), 56.25 ether);
+    }
+
+    function testConvertTriesExactlyNineTranchesDownToOneTwoHundredFiftySixth() public {
+        hook.setPotMarg(256);
+        hook.setMaxSell(1); // the ninth and last tranche, pot / 256, is the only one that sells
+        assertEq(judge.convertForfeits(), 2);
+        assertEq(hook.sells(), 1);
+        assertEq(hook.potMarg(), 255);
+        // one halving further would be needed: the hook's last reason surfaces and nothing is sold
+        hook.setPotMarg(512);
+        hook.setMaxSell(1);
+        vm.expectRevert(bytes("floor"));
+        judge.convertForfeits();
+        assertEq(hook.potMarg(), 512);
+    }
+
+    function testConvertNeverSellsMoreThanThePot() public {
+        hook.setPotMarg(7);
+        hook.setMaxSell(7);
+        assertEq(judge.convertForfeits(), 14);
+        assertEq(hook.potMarg(), 0);
+        assertEq(judge.convertForfeits(), 0, "an empty pot was sold");
+        assertEq(hook.sells(), 1);
     }
 }
 
