@@ -14,7 +14,8 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaHook` | The hook (flags `0x20cc`): binds the launch pool, takes the stamp and deposit on noted buys and the 1%/3% fee on sells, holds notes, observations, records and the three pools, and pays out. Its constructor clones the three companions (EIP-1167) from audited implementations and initialises each once. |
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
-| `MarginaliaTreasury` | Receives prizes and gifts; drips 2% of its IMD into the pot daily. No withdraw. |
+| `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pools daily. No withdraw; refuses ETH. |
+| `MarginaliaMath` | Stateless score arithmetic (log2, sqrt, median, difficulty) the hook calls by staticcall; kept out of the hook for code size. |
 
 ## How the pot pays
 
@@ -32,7 +33,8 @@ except through the score, which is difficulty-weighted, netted against wrong cal
 ## Deployment order
 
 1. Contracts-only launch: `MarginaliaRouter`, `MarginaliaJudge`, `MarginaliaTreasury` implementations
-   (ownerless; never initialised themselves).
+   (ownerless; they lock themselves in their constructors so only clones can be initialised, once, by the hook)
+   and `MarginaliaMath`.
 2. Set the three addresses in `src/MarginaliaImpls.sol`.
 3. Hook launch (`launch.json`): the factory deploys the token and the hook; the hook's constructor clones
    the three implementations and initialises each with itself in the same transaction.
@@ -62,6 +64,17 @@ MAINNET_RPC_URL=https://... forge test --match-path test/fork/MainnetLaunch.t.so
 `launch.json` is the factory manifest: `MarginaliaHook($poolManager, $token, $factory)`, permissions as
 listed, pool paired with IMD at fee 12500 / tick spacing 60. The requester's share seeds the pool
 single-sided; the swarm's 10% goes to the launch's distributor.
+
+## Audit history
+
+The swarm's four-specialist panel reviewed the whole repository during the first implementations launch
+(job `0c08497a`, 2026-10-10) and merged 14 reproduced findings, led by a self-priced venue (any contract
+answering `slot0()` could set a note's price) and a leaderboard sweep that paid twice. All are fixed in
+commit `1e6388a`: every price venue and trade venue is now checked against the canonical Uniswap factories
+(v3/v2) or recomputed from the full key with liquidity (v4) in the router, sweeps zero their pools, an
+unanswered judging request can be retried after three days, quiet weeks' thesis pools sweep once the judge
+confirms nothing is pending, implementations lock themselves against stray `init` calls, sells of pot MARG
+require a whole fill with a slippage floor, and the Attested class can no longer be self-declared.
 
 ## v1 scope and known limits
 

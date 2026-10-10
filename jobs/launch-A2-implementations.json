@@ -1,0 +1,49 @@
+{
+ "action": "launch.open",
+ "input": {
+  "objective": "Deploy the Marginalia companion IMPLEMENTATIONS from this repository on Ethereum mainnet: src/MarginaliaRouter.sol, src/MarginaliaJudge.sol, src/MarginaliaTreasury.sol and src/MarginaliaMath.sol, each with no constructor arguments. Router, Judge and Treasury are EIP-1167 implementation targets that lock themselves in their constructors (hook = address(1)) so only zero-storage clones can ever be initialised, once, by the cloning hook; MarginaliaMath is a stateless pure-function contract the hook calls by staticcall. No owner, no pause, no upgrade anywhere. A later univ4_hook launch (MarginaliaHook) clones them in its constructor and calls each clone's one-shot init. What each does: MarginaliaRouter posts notes by swapping IMD for MARG with hookData, optionally trading any ERC-20 on Uniswap v4, v3 or v2 in the same transaction (the note must be about the token traded); MarginaliaJudge is the IdentityMD oracle consumer (EIP-712 \"IdentityMD Oracle\" v2) that once a week buys the panel ranking of the week's long-form theses through the Intake 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56 and tells the hook whom to pay; MarginaliaTreasury holds IMD and drips 2% a day into the hook's pools, no withdraw. Who can call what: anyone, except init (once, by the cloning hook). Numbers: 0.25% action fee is NOT in this version; judge threshold 2 IMD, oracle price 0.5 IMD, prize split 50/30/20; treasury drip 2%. Upgrades and pausing: none. Outside services: Uniswap v4 PoolManager 0x000000000004444c5dc75cb358380d2e3de08a90, IMD 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7, the IdentityMD Intake. No token is deployed by this launch. This commit incorporates the previous launch's audit findings (canonical Uniswap venue validation, sweep accounting, judge retry and thesis-pool sweep, locked implementations, full-fill sells with a slippage floor, fee-on-transfer pulls). Do not change the contracts' logic: audit, adapt to the launcher, and deploy. Tests are in test/ (forge test --no-match-path test/fork/*).",
+  "repoUrl": "https://github.com/auntjemaima24/marginalia.git",
+  "baseCommit": "1e6388ad189a8036f02818b9864ce416021d7a24",
+  "onchain": "evm_contracts",
+  "chainId": 1,
+  "github": true,
+  "contracts": [
+   "src/MarginaliaRouter.sol",
+   "src/MarginaliaJudge.sol",
+   "src/MarginaliaTreasury.sol",
+   "src/MarginaliaMath.sol"
+  ],
+  "shape": "chain",
+  "references": [
+   "uniswap-v4-hooks",
+   "eth-security"
+  ],
+  "steps": [
+   {
+    "skill": "audit-imported-code"
+   },
+   {
+    "skill": "adapt-contract-project"
+   },
+   {
+    "skill": "adversarial-review"
+   }
+  ]
+ },
+ "_check": {
+  "plan": [
+   "Audit your contracts as they are, as another agent",
+   "Adapt them to launch, fixing what the audit found",
+   "Test them, as another agent",
+   "Write what to deploy",
+   "Audit the math, as a specialist agent",
+   "Audit the permissions, as a specialist agent",
+   "Audit the economics, as a specialist agent",
+   "Audit the control flow, as a specialist agent",
+   "Judge the audit: reproduce, merge and rank what was found",
+   "Deploy on Ethereum mainnet"
+  ],
+  "checkedAt": "2026-10-10",
+  "note": "implementations v2: post-audit fixes, 4 contracts incl. MarginaliaMath"
+ }
+}
