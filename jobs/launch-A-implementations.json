@@ -1,0 +1,47 @@
+{
+ "action": "launch.open",
+ "input": {
+  "objective": "Deploy the Marginalia companion IMPLEMENTATIONS from this repository on Ethereum mainnet: src/MarginaliaRouter.sol, src/MarginaliaJudge.sol and src/MarginaliaTreasury.sol, each with no constructor arguments. They are EIP-1167 implementation targets: never initialised themselves, no owner, no pause, no upgrade. A later univ4_hook launch (MarginaliaHook) clones them in its constructor and calls each clone's one-shot init. What each does: MarginaliaRouter posts notes by swapping IMD for MARG with hookData, optionally trading any ERC-20 on Uniswap v4, v3 or v2 in the same transaction (the note must be about the token traded); MarginaliaJudge is the IdentityMD oracle consumer (EIP-712 \"IdentityMD Oracle\" v2) that once a week buys the panel ranking of the week's long-form theses through the Intake 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56 and tells the hook whom to pay; MarginaliaTreasury holds IMD and drips 2% a day into the hook's pools, no withdraw. Who can call what: anyone, except init (once, by the cloning hook). Numbers: 0.25% action fee is NOT in this version; judge threshold 2 IMD, oracle price 0.5 IMD, prize split 50/30/20; treasury drip 2%. Upgrades and pausing: none. Outside services: Uniswap v4 PoolManager 0x000000000004444c5dc75cb358380d2e3de08a90, IMD 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7, the IdentityMD Intake. No token is deployed by this launch. Do not change the contracts' logic: audit, adapt to the launcher, and deploy. Tests are in test/ (forge test --no-match-path test/fork/*).",
+  "repoUrl": "https://github.com/auntjemaima24/marginalia.git",
+  "baseCommit": "9c4f5a402e5e4a5a1dc0a83a08b397ff32040277",
+  "onchain": "evm_contracts",
+  "chainId": 1,
+  "github": true,
+  "contracts": [
+   "src/MarginaliaRouter.sol",
+   "src/MarginaliaJudge.sol",
+   "src/MarginaliaTreasury.sol"
+  ],
+  "shape": "chain",
+  "references": [
+   "uniswap-v4-hooks",
+   "eth-security"
+  ],
+  "steps": [
+   {
+    "skill": "audit-imported-code"
+   },
+   {
+    "skill": "adapt-contract-project"
+   },
+   {
+    "skill": "adversarial-review"
+   }
+  ]
+ },
+ "_check": {
+  "plan": [
+   "Audit your contracts as they are, as another agent",
+   "Adapt them to launch, fixing what the audit found",
+   "Test them, as another agent",
+   "Write what to deploy",
+   "Audit the math, as a specialist agent",
+   "Audit the permissions, as a specialist agent",
+   "Audit the economics, as a specialist agent",
+   "Audit the control flow, as a specialist agent",
+   "Judge the audit: reproduce, merge and rank what was found",
+   "Deploy on Ethereum mainnet"
+  ],
+  "checkedAt": "2026-10-10"
+ }
+}
