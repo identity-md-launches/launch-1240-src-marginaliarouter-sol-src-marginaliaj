@@ -28,7 +28,9 @@ async function readBody(req) {
 }
 
 async function proxy(req, res, method, apiPath, { auth = false, body = null, headers = {} } = {}) {
-  const h = { 'content-type': 'application/json', ...headers };
+  // The challenge call is a POST with no body: sending a JSON content-type with nothing in it is refused.
+  const h = { ...headers };
+  if (body != null) h['content-type'] = 'application/json';
   if (auth) h.authorization = `Bearer ${token()}`;
   const r = await fetch(IMD_API + apiPath, { method, headers: h, body: body == null ? undefined : body });
   const text = await r.text();
