@@ -1,0 +1,22 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MarginaliaRouter",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaJudge",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaTreasury",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaPricer",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "Deploy the four Marginalia companions on Ethereum mainnet with no constructor arguments or constructor dependencies. Router, Judge and Treasury are implementation targets: their constructors lock hook to address(1), preventing initialization of the implementations. A later MarginaliaHook launch creates their immutable EIP-1167 clones and calls each clone's one-shot init from the hook constructor. MarginaliaPricer is stateless and used directly through static calls. This launch deploys no hook, token or pool and performs no initialization calls or ETH funding. None of these contracts has an owner, pause or upgrade mechanism. Router posts notes through IMD/MARG swaps with hookData and can atomically trade the note's token on canonical Uniswap v4, v3 or v2 venues; it validates venues, restricts callbacks, measures actual token pulls and enforces caller-supplied slippage limits. Judge requests weekly thesis rankings through the IdentityMD Intake, verifies EIP-712 IdentityMD Oracle v2 attestations, supports unanswered-request retries and tells the hook whom to pay. Treasury permits anyone to drip 2% of its IMD balance once per UTC day into the hook's pools, with no withdrawal function. Pricer supplies score arithmetic and price reads: v3/v2 settlement uses accumulator TWAPs between the first and last observations, while v4 prices and the ETH-to-IMD hub leg use the least favourable observation for the call (minimum for BUY, maximum for SELL). The hook enforces an observation span of at least one hour. Pricer also requires aged venue history for posting prices and assumes 18-decimal assets. Runtime configuration belongs to the later hook launch: Uniswap v4 PoolManager 0x000000000004444c5dc75cb358380d2e3de08a90, IMD 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7 and Intake 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56."
+}
