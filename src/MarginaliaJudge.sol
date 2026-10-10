@@ -61,6 +61,7 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
 
     event Requested(uint32 indexed day, bytes32 indexed requestId, uint256 price);
     event Judged(uint32 indexed day, bytes32[3] ids);
+    event Abandoned(uint32 indexed day, bytes32 indexed requestId);
 
     /// @dev The implementation locks itself (placeholder hook and signer); a clone gets the real ones from `init`.
     constructor() OracleAttestationConsumer(address(1)) {
@@ -80,11 +81,28 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         _setOracleSigner(signer_);
     }
 
-    /// @notice Converts any forfeited MARG into IMD for today's pot. Anyone, any time.
+    /// @dev The whole pot is tried first, then halves of it, down to 1/256: a pot that has outgrown what the
+    /// pool absorbs inside the hook's slippage floor converts in tranches instead of being stranded.
+    uint256 public constant CONVERT_HALVINGS = 8;
+
+    /// @notice Converts forfeited MARG into IMD for today's pot: the whole pot if the pool absorbs it within
+    /// the hook's floor, otherwise the largest halving of it that does. Anyone, any time. Reverts with the
+    /// hook's reason only when not even the smallest tranche sells (a stale window or a pushed price).
     function convertForfeits() external nonReentrant returns (uint256 imdOut) {
         uint256 marg = hook.potMarg();
         if (marg == 0) return 0;
-        imdOut = hook.sellPotMarg(marg);
+        bytes memory reason;
+        for (uint256 i = 0; i <= CONVERT_HALVINGS && marg > 0; ++i) {
+            try hook.sellPotMarg(marg) returns (uint256 out) {
+                return out;
+            } catch (bytes memory r) {
+                reason = r;
+            }
+            marg /= 2;
+        }
+        assembly ("memory-safe") {
+            revert(add(reason, 32), mload(reason))
+        }
     }
 
     /// @notice The oracle body for a day: deterministic from the day's note ids, so anyone can check it.
@@ -159,14 +177,25 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         return out;
     }
 
-    /// @notice Whether a week can never be judged again: no eligible theses, or nothing pending and nothing judged.
+    /// @notice Whether a week can never be judged again: nothing judged, no request still deliverable (none
+    /// made, or the last one abandoned), and either no eligible theses or four weeks past the week's end.
     function weekClosed(uint32 week) external view returns (bool) {
         if (week >= hook.week()) return false;
         if (judgedSet[week]) return false;
-        if (requestOf[week] != bytes32(0) && block.timestamp < requestedAt[week] + ANSWER_DEADLINE) {
-            return false;
-        }
+        if (requestOf[week] != bytes32(0) && pendingDay[requestOf[week]] != 0) return false;
         return eligibleTheses(week).length == 0 || block.timestamp >= (uint256(week) + 1) * 7 days + 28 days;
+    }
+
+    /// @notice Anyone invalidates an unanswered request once its deadline has passed, so a late delivery can no
+    /// longer land on a week whose thesis pool has been swept. A retry does the same before re-requesting.
+    function abandonRequest(uint32 week) external {
+        bytes32 id = requestOf[week];
+        if (id == bytes32(0) || pendingDay[id] == 0) revert UnknownRequest();
+        if (judgedSet[week] || block.timestamp < requestedAt[week] + ANSWER_DEADLINE) {
+            revert AlreadyRequested();
+        }
+        delete pendingDay[id];
+        emit Abandoned(week, id);
     }
 
     /// @notice Buys the panel's ranking for a finished week whose thesis pool clears the hook's threshold.
@@ -209,9 +238,11 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         delete pendingDay[requestId];
         uint32 day = stored - 1;
         _verifyAttestation(a, signature);
-        if (a.agreed < a.quorum || a.quorum < QUORUM || a.panelSize < PANEL_SIZE || judgedSet[day]) {
-            revert BadAnswer();
-        }
+        // The question is about this chain (questionBody pins block.chainid), so the answer must be too.
+        if (
+            a.chainId != block.chainid || a.agreed < a.quorum || a.quorum < QUORUM || a.panelSize < PANEL_SIZE
+                || judgedSet[day]
+        ) revert BadAnswer();
         bytes32[] memory ranked = decodeBytes32List(a);
         _consume(a.requestId);
         // The question requests head=3. Bound storage writes to fit the Intake's 200k callback

@@ -98,7 +98,7 @@ contract MarginaliaPricer {
 
     function sqrt(uint256 x) public pure returns (uint256 y) {
         if (x == 0) return 0;
-        uint256 z = (x + 1) / 2;
+        uint256 z = x / 2 + 1; // (x + 1) / 2 overflows at type(uint256).max
         y = x;
         while (z < y) {
             y = z;
@@ -148,7 +148,9 @@ contract MarginaliaPricer {
             x = twap(v.kind, v.xIsToken0, w.xStart, w.startedAt, x, uint64(block.timestamp));
         }
         q = _adverse(buy ? w.quoteMax : w.quoteMin, q, !buy);
-        return FullMath.mulDiv(x, q, 1e18);
+        uint256 p = FullMath.mulDiv(x, q, 1e18);
+        if (p == 0) revert EmptyPool();
+        return p;
     }
 
     // ------------------------------------------------------------------ observations
@@ -192,7 +194,9 @@ contract MarginaliaPricer {
         for (uint256 i = 1; i < n; ++i) {
             q = _adverse(q, obs[i].quoteRead, buy);
         }
-        return FullMath.mulDiv(x, q, 1e18);
+        uint256 p = FullMath.mulDiv(x, q, 1e18);
+        if (p == 0) revert EmptyPool();
+        return p;
     }
 
     /// @notice Time-weighted average price of X between two readings of the same accumulator.
@@ -216,7 +220,9 @@ contract MarginaliaPricer {
             unchecked {
                 avg = (c2 - c1) / dt; // the v2 accumulator wraps by design; the difference does not
             }
-            return FullMath.mulDiv(avg, 1e18, Q112); // UQ112x112 -> 1e18
+            uint256 p = FullMath.mulDiv(avg, 1e18, Q112); // UQ112x112 -> 1e18
+            if (p == 0) revert EmptyPool();
+            return p;
         }
         revert Unsupported();
     }
@@ -237,7 +243,9 @@ contract MarginaliaPricer {
         if (v.kind == T.VenueKind.UniV2) {
             (uint112 r0, uint112 r1,) = IUniswapV2PairOracle(ref).getReserves();
             if (r0 == 0 || r1 == 0) revert EmptyPool();
-            return v.xIsToken0 ? FullMath.mulDiv(r1, 1e18, r0) : FullMath.mulDiv(r0, 1e18, r1);
+            uint256 p = v.xIsToken0 ? FullMath.mulDiv(r1, 1e18, r0) : FullMath.mulDiv(r0, 1e18, r1);
+            if (p == 0) revert EmptyPool();
+            return p;
         }
         revert Unsupported();
     }
@@ -280,13 +288,17 @@ contract MarginaliaPricer {
         return buy ? (b < a ? b : a) : (b > a ? b : a);
     }
 
-    /// @dev price of token0 in token1 = sqrtP^2 / 2^192; inverted when X is token1.
+    /// @dev price of token0 in token1 = sqrtP^2 / 2^192; inverted when X is token1. A price that rounds to
+    /// zero in either orientation (below 1e-18 of the quote) is refused: a zero baseline would make every
+    /// BUY call on the venue vacuously right, and a zero settlement every SELL call.
     function fromSqrt(uint160 sqrtP, bool xIsToken0) public pure returns (uint256) {
         if (sqrtP == 0) revert EmptyPool();
         uint256 p = FullMath.mulDiv(uint256(sqrtP), uint256(sqrtP), Q96);
         p = FullMath.mulDiv(p, 1e18, Q96);
-        if (xIsToken0) return p;
         if (p == 0) revert EmptyPool();
-        return FullMath.mulDiv(1e18, 1e18, p);
+        if (xIsToken0) return p;
+        p = FullMath.mulDiv(1e18, 1e18, p);
+        if (p == 0) revert EmptyPool();
+        return p;
     }
 }

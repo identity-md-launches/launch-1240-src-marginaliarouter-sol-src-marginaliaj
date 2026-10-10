@@ -139,3 +139,41 @@ one-hour settlement observation span remain in place.
 - The four local CREATE2 implementation deployments used **8,694,125 gas**, excluding the test's
   opcode-scanning loop and any production factory overhead.
 - No live mainnet fork, Slither, Mythril, explorer verification or broadcast is claimed.
+
+## Revision round 2 (2026-10-11): reviewer findings
+
+Each finding was reproduced before anything changed (the two supplied proofs failed on the starting tree
+and pass now; `.imd-responses.json` carries the verdicts). Changes, by file:
+
+- `src/MarginaliaPricer.sol` (finding `4772e72b`, zero prices; `272fbe0d`): `fromSqrt` reverts `EmptyPool`
+  when a price rounds to zero in either orientation; the v2 spot and v2 TWAP, `postPrice` and `settlePrice`
+  reject a zero result. `sqrt` seeds with `x / 2 + 1` so `type(uint256).max` no longer overflows.
+- `src/MarginaliaJudge.sol` (`70ce87bf`, stranded pot): `convertForfeits` tries the whole pot, then halves
+  down to 1/256 (`CONVERT_HALVINGS`), through the unchanged judge-only `sellPotMarg` and its unchanged 97%
+  floor, and re-raises the hook's reason only if no tranche sells. (`f0aea555`): `weekClosed` stays false
+  while a request is still deliverable; new permissionless `abandonRequest(week)` invalidates an unanswered
+  request after `ANSWER_DEADLINE`, after which the week can be swept and a late delivery is refused.
+  (`b5fc440f`): `onOracleResult` requires `a.chainId == block.chainid`.
+- `src/MarginaliaHook.sol` (`ce3d30ae`, dust voids a SELL): the hold rule is `_broken`; a SELL call breaks
+  only when the balance grows by more than `SELL_HOLD_TOLERANCE_BPS` (10%) of the post balance and the
+  deposit's worth of X. (`7fa6bcfb`, slot squatting): `observe` keeps the slot spacing and cap, but a reading
+  more adverse to the call than the latest entry replaces it (`_moreAdverse`). (`542fd714`, switchable
+  `balanceOf`): the balance is read by bounded-gas staticcall (`_balanceOf`); a failed read is the
+  unverifiable sentinel and counts as not held. (`0a0c1d10`, free option): `VoidNoData` books `-difficulty`
+  while the deposit remains claimable. (`7539406d`): `MAX_WEEK_THESES = 120` replaces the silent 256 cut;
+  a 121st thesis reverts before its stamp and deposit are taken. (`4772e72b`): a zero baseline is refused
+  and a series the pricer cannot price settles `VoidNoData` instead of reverting forever. Hook runtime is
+  24,442 bytes (limit 24,576).
+- `src/MarginaliaRouter.sol` (`6948a02b`, v3 branch): a canonical v3 pool with zero liquidity is refused.
+- Tests: `test/RevisionFindings.t.sol` (one test per change above), `test/PotTranche.t.sol` (the reviewer's
+  proof kept as the regression, plus the pot draining across fresh windows), `test/Lifecycle.t.sol`
+  `testNoDataRefunds` updated for the negative score. The supplied proofs were run from `test/scratch/`.
+
+Disputed, with reasons in `.imd-responses.json`: `6948a02b` (venue admission is the project's design and
+has no owner-settable policy; the free variants are closed and the limit is documented), `ec6beba1` (the
+adverse-extreme rule is the one the brief specifies; its cost is a paid round trip), `86e81b29` (concerns
+the later hook launch, recorded as its first work item). The four implementation constructors are
+unchanged: still empty, still locking `hook = address(1)`, still making no external calls.
+
+Validation after this round: `forge build` passes (warnings only); `forge test --no-match-path 'test/fork/*'`
+passes every test; the two reviewer proofs pass from `test/scratch/`.

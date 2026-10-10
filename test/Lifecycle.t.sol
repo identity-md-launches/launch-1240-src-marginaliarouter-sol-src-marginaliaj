@@ -31,7 +31,8 @@ contract LifecycleTest is Fixture {
     }
 
     function _pot() internal view returns (uint256) {
-        return hook.refundPool(hook.today()) + hook.leaderboardPool(hook.week()) + hook.thesisPool(hook.week());
+        return
+            hook.refundPool(hook.today()) + hook.leaderboardPool(hook.week()) + hook.thesisPool(hook.week());
     }
 
     function testFlagsAndBinding() public view {
@@ -57,7 +58,8 @@ contract LifecycleTest is Fixture {
 
     function testNotedBuyTakesStampAndDeposit() public {
         uint256 margBefore = token.balanceOf(alice);
-        (bytes32 id, uint256 received) = _note(alice, _margNote(T.Side.Buy, 20_000, 7, "2x: fee pot compounding"), 10 ether);
+        (bytes32 id, uint256 received) =
+            _note(alice, _margNote(T.Side.Buy, 20_000, 7, "2x: fee pot compounding"), 10 ether);
         T.Note memory n = hook.noteOf(id);
         assertEq(n.author, alice);
         assertEq(uint8(n.status), uint8(T.Status.Open));
@@ -119,7 +121,9 @@ contract LifecycleTest is Fixture {
     }
 
     function testRightCallReturnsDepositAsImd() public {
-        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11_000, 1, "+10% in a day: the airdrop sells are done"), 10 ether);
+        (bytes32 id,) = _note(
+            alice, _margNote(T.Side.Buy, 11_000, 1, "+10% in a day: the airdrop sells are done"), 10 ether
+        );
         // bob pushes the price up more than 10%
         _buy(bob, 1_500_000 ether);
         assertGt(hook.margPriceInImd(), 1.1e18);
@@ -195,7 +199,10 @@ contract LifecycleTest is Fixture {
         vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
         hook.settle(id);
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidNoData));
-        assertEq(_rec(alice).score, 0);
+        // Revision finding 0a0c1d10: an unobserved call is not a free option. It scores as a wrong one
+        // (so posting both sides and observing only the winner nets zero) but its deposit still comes back.
+        assertLt(_rec(alice).score, 0);
+        assertEq(_rec(alice).wrong, 0);
         uint256 before = token.balanceOf(alice);
         vm.prank(alice);
         hook.claimDeposit(id, false);
@@ -217,7 +224,8 @@ contract LifecycleTest is Fixture {
     }
 
     function testThesisParentChild() public {
-        T.NoteParams memory thesis = _margNote(T.Side.Buy, 0, 0, "Privacy re-rates after the next exploit: citations...");
+        T.NoteParams memory thesis =
+            _margNote(T.Side.Buy, 0, 0, "Privacy re-rates after the next exploit: citations...");
         (bytes32 tid,) = _note(alice, thesis, 10 ether);
         assertEq(uint8(hook.noteOf(tid).status), uint8(T.Status.ThesisOpen));
         T.NoteParams memory child = _margNote(T.Side.Buy, 11_000, 1, "child call");
@@ -459,6 +467,7 @@ contract LifecycleTest is Fixture {
         assertEq(_pot() - potBefore, out);
         assertEq(_claims(address(hook), address(token)), 0);
     }
+
     /// @dev The parked finding: pump, observe one block later, unwind. The adverse rule settles on the honest
     /// observations around it, so the pumped block is worth nothing to the caller.
     function testTwoBlockPumpObserveUnwindSettlesWrong() public {

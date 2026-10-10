@@ -56,7 +56,14 @@ contract MarginaliaHook is IUnlockCallback {
     /// @dev Observations must span at least this long, so no single block (or pair of blocks) sets the price.
     uint256 public constant OBS_MIN_SPAN = 1 hours;
     uint256 public constant KEEPER_BPS = 200;
-    uint256 public constant MAX_DAY_NOTES = 256;
+    /// @dev A week's theses are capped at what the judge can put in front of the panel (its MAX_JUDGED), and a
+    /// thesis past the cap is refused before its stamp and deposit are taken, never silently unjudgeable.
+    uint256 public constant MAX_WEEK_THESES = 120;
+    /// @dev A SELL call is void only if the author's balance grows by more than this share of its post balance
+    /// (and by more than the deposit's worth of X): a stranger's dust transfer cannot void it.
+    uint256 public constant SELL_HOLD_TOLERANCE_BPS = 1000;
+    /// @dev Gas allowed to a note token's balanceOf during an observation; a read that fails is "not held".
+    uint256 public constant BALANCE_READ_GAS = 100_000;
     uint256 public constant JUDGE_THRESHOLD = 2 ether; // IMD, in the week's thesis pot
     uint256 public constant JUDGE_PRICE = 0.5 ether; // IMD, the Intake's oracle.request price
     uint256 public constant LEADERBOARD_BPS = 5000; // of every accrual: the week's score-weighted pool
@@ -442,9 +449,11 @@ contract MarginaliaHook is IUnlockCallback {
         notesPerDay[n.day] += 1;
         if (thesis) {
             n.status = T.Status.ThesisOpen;
-            if (weekTheses[_week()].length < MAX_DAY_NOTES) weekTheses[_week()].push(id);
+            if (weekTheses[_week()].length >= MAX_WEEK_THESES) revert InvalidNote();
+            weekTheses[_week()].push(id);
         } else {
             n.postPrice = router.postPrice(p.venue, p.side == T.Side.Buy);
+            if (n.postPrice == 0) revert InvalidNote(); // the pricer refuses these; never trust a zero baseline
             // The MARG this very swap delivers reaches the author after the callback; count it for a note on MARG.
             n.postBalance = IERC20(p.x).balanceOf(author) + (p.x == token ? margToAuthor : 0);
             if (p.parentId != bytes32(0)) {
@@ -480,8 +489,10 @@ contract MarginaliaHook is IUnlockCallback {
     }
 
     /// @notice Anyone records an observation inside the settlement window: the venue's accumulator (v3 / v2)
-    /// or spot (v4), the quote leg's spot, and the author's balance. Spaced by blocks and, across the series,
-    /// by at least OBS_MIN_SPAN: one honest observation defeats a pump that is not held for the whole span.
+    /// or spot (v4), the quote leg's spot, and the author's balance. Series slots are spaced by blocks and
+    /// capped, but a slot is never owned: while it is taken, a reading more adverse to the call than the
+    /// latest one replaces it. So a pump-observe-unwind in one block is overwritten by any honest reading in
+    /// the next, and the series must span OBS_MIN_SPAN: a pump has to be held for the whole span.
     function observe(bytes32 id) external {
         T.Note storage n = _note(id);
         if (n.status != T.Status.Open) revert NotOpen();
@@ -489,14 +500,58 @@ contract MarginaliaHook is IUnlockCallback {
         if (block.timestamp < end) revert TooEarly();
         if (block.timestamp > end + SETTLE_WINDOW) revert TooLate();
         T.Observation[] storage obs = observations[id];
-        if (obs.length >= OBS_MAX) revert TooLate();
-        if (obs.length > 0 && block.number < obs[obs.length - 1].blockNumber + OBS_GAP_BLOCKS) {
-            revert ObservationTooSoon();
-        }
         (uint256 xRead, uint256 quoteRead) = pricer().observe(poolManager, n.venue, imd);
-        uint256 balance = IERC20(n.x).balanceOf(n.author);
-        obs.push(T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance));
+        uint256 balance = _balanceOf(n.x, n.author);
+        T.Observation memory o =
+            T.Observation(uint64(block.timestamp), uint64(block.number), xRead, quoteRead, balance);
+        uint256 len = obs.length;
+        if (len > 0 && (len >= OBS_MAX || block.number < obs[len - 1].blockNumber + OBS_GAP_BLOCKS)) {
+            if (!_moreAdverse(n, o, obs[len - 1])) revert ObservationTooSoon();
+            obs[len - 1] = o;
+        } else {
+            obs.push(o);
+        }
         emit Observed(id, uint64(block.timestamp), xRead, quoteRead, balance);
+    }
+
+    /// @dev The author's X balance by staticcall with bounded gas. A read that reverts, re-enters or returns
+    /// nothing is recorded as unverifiable (the sentinel), which the hold rule treats as not held: a token the
+    /// author can switch off is never a free option on the settlement.
+    function _balanceOf(address x, address who) private view returns (uint256) {
+        (bool ok, bytes memory ret) =
+            x.staticcall{gas: BALANCE_READ_GAS}(abi.encodeWithSelector(IERC20.balanceOf.selector, who));
+        if (!ok || ret.length < 32) return type(uint256).max;
+        return abi.decode(ret, (uint256));
+    }
+
+    /// @dev Whether an observed balance breaks the hold rule: a BUY call must keep its post balance; a SELL
+    /// call must not grow it by more than SELL_HOLD_TOLERANCE_BPS and the deposit's worth of X, so only a
+    /// buy-back of real size, not a stranger's dust, voids it. The unverifiable sentinel breaks either.
+    function _broken(T.Note storage n, uint256 balance) private view returns (bool) {
+        if (balance == type(uint256).max) return true;
+        if (n.side == T.Side.Buy) return balance < n.postBalance;
+        uint256 tolerance = n.postBalance * SELL_HOLD_TOLERANCE_BPS / 10_000;
+        uint256 depositWorth = FullMath.mulDiv(DEPOSIT, 1e18, n.postPrice);
+        if (depositWorth > tolerance) tolerance = depositWorth;
+        return balance > n.postBalance + tolerance;
+    }
+
+    /// @dev Whether a reading is more adverse to the call than the one it would replace: a worse price (v4:
+    /// the venue spot times the quote leg; v3 / v2: the quote leg, the accumulator being a TWAP input), or a
+    /// hold breach the earlier reading did not show. A breach is never replaced by a non-breach.
+    function _moreAdverse(T.Note storage n, T.Observation memory o, T.Observation memory last)
+        private
+        view
+        returns (bool)
+    {
+        bool brokenNew = _broken(n, o.balance);
+        bool brokenLast = _broken(n, last.balance);
+        if (brokenLast && !brokenNew) return false;
+        if (brokenNew && !brokenLast) return true;
+        bool v4 = n.venue.kind == T.VenueKind.UniV4;
+        uint256 pn = v4 ? FullMath.mulDiv(o.xRead, o.quoteRead, 1e18) : o.quoteRead;
+        uint256 pl = v4 ? FullMath.mulDiv(last.xRead, last.quoteRead, 1e18) : last.quoteRead;
+        return n.side == T.Side.Buy ? pn < pl : pn > pl;
     }
 
     /// @notice Anyone settles a note once its window has closed. The keeper earns 2% of a forfeited deposit.
@@ -514,12 +569,17 @@ contract MarginaliaHook is IUnlockCallback {
         } else {
             bool held = true;
             for (uint256 i = 0; i < count; ++i) {
-                if (n.side == T.Side.Buy ? obs[i].balance < n.postBalance : obs[i].balance > n.postBalance) {
-                    held = false;
-                }
+                if (_broken(n, obs[i].balance)) held = false;
             }
-            settlePrice = pricer().settlePrice(n.venue, n.side == T.Side.Buy, obs);
-            if (!held) {
+            // A series the pricer cannot turn into a price (a venue that died, a TWAP out of range) is no data.
+            try pricer().settlePrice(n.venue, n.side == T.Side.Buy, obs) returns (uint256 price) {
+                settlePrice = price;
+            } catch {
+                settlePrice = 0;
+            }
+            if (settlePrice == 0) {
+                outcome = T.Status.VoidNoData;
+            } else if (!held) {
                 outcome = T.Status.VoidSold;
             } else if (n.side == T.Side.Buy) {
                 outcome = settlePrice * 10_000 >= n.postPrice * n.targetBps ? T.Status.Right : T.Status.Wrong;
@@ -533,6 +593,10 @@ contract MarginaliaHook is IUnlockCallback {
         if (outcome == T.Status.Right) {
             scoreDelta = int256(_difficulty(n));
             r.right += 1;
+        } else if (outcome == T.Status.VoidNoData) {
+            // Unproven scores as wrong (the deposit still comes back): an author cannot post both sides and
+            // observe only the one the market confirmed.
+            scoreDelta = -int256(_difficulty(n));
         } else if (outcome == T.Status.Wrong) {
             scoreDelta = -int256(_difficulty(n));
             r.wrong += 1;

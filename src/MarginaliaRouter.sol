@@ -27,6 +27,7 @@ interface IUniswapV3PoolSwap {
     function token0() external view returns (address);
     function token1() external view returns (address);
     function fee() external view returns (uint24);
+    function liquidity() external view returns (uint128);
     function swap(
         address recipient,
         bool zeroForOne,
@@ -215,6 +216,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
             if (IUniswapV3FactoryMinimal(UNIV3_FACTORY).getPool(t0, t1, pool.fee()) != address(pool)) {
                 revert BadVenue();
             }
+            if (pool.liquidity() == 0) revert BadVenue(); // an empty v3 pool's tick moves for free
         } else if (v.kind == T.VenueKind.UniV2) {
             IUniswapV2PairSwap pair = IUniswapV2PairSwap(address(uint160(uint256(v.ref))));
             t0 = pair.token0();

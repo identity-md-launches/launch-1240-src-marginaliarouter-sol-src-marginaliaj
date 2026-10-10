@@ -108,6 +108,19 @@ must span at least an hour. Accumulator prices weight the elapsed time, and an h
 pin the v4/hub extreme; sampled extremes do not measure prices between observations. Tests: `testTwoBlockPumpObserveUnwindSettlesWrong` (local),
 `testTradeAndNoteOnUniswapV3` settles LINK on the live v3 accumulator (fork), `test/Pricer.t.sol`.
 
+The second implementations review (2026-10-11) reopened the launch on eight reproduced findings; all are
+answered in `.imd-responses.json` and listed in `ADAPTATION.md`. In short: a price that rounds to zero is
+refused everywhere; forfeited MARG converts in tranches (`convertForfeits` sells the largest halving of the
+pot the pool absorbs); a stranger's dust cannot void a SELL call (a buy-back must exceed 10% of the post
+balance and the deposit's worth); an observation slot is never owned (a more adverse reading replaces the
+latest entry, so a one-block pump is overwritten next block); a note token whose `balanceOf` fails is "not
+held" (VoidSold, never a refundable void); an unobserved call scores as wrong though its deposit returns;
+a week holds at most 120 theses and refuses the 121st before taking anything; `abandonRequest` invalidates
+an unanswered judging request after its deadline so a thesis pool is never swept from under a deliverable
+answer; and an attestation must be about this chain. Two findings are disputed as design: any canonical
+Uniswap pool is a venue (an author can be its only participant: see the limits below), and the adverse
+extreme can be moved against a call by a paid round trip, which is the cost of the rule the launch asks for.
+
 ## v1 scope and known limits
 
 - Price reads assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
@@ -119,5 +132,12 @@ pin the v4/hub extreme; sampled extremes do not measure prices between observati
 - The implementation addresses in `MarginaliaImpls.sol` are rehearsal placeholders; tests etch code there.
 - The action fee on follow trades, treasury conversion of ETH/USDC/USDT to IMD, the on-chain ERC-8004 agent
   badge (contract wallets are marked Agent), and attestation re-delivery are specified but not yet built.
-- The judge binds an answer to the Intake request it paid for; it does not recompute the oracle's
-  canonical question hash.
+- The judge binds an answer to the Intake request it paid for and to this chain id; it does not recompute
+  the oracle's canonical question hash (the eligible set can change after the request), so the Intake is
+  trusted to deliver each answer under the request it was bought for.
+- Venue admission is "any canonical Uniswap pool with liquidity". An author who is the only LP and trader of
+  a hookless pool for a token it controls can price its own notes and choose the supply behind the score
+  tier; the leaderboard cap (10% of a week's pool per wallet) bounds, but does not remove, what such calls
+  draw. A depth, age or counterparty policy is a design decision for the requester (there is no owner).
+- The later hook launch must take the four implementation addresses as constructor arguments (verified on
+  first use) rather than requiring their code at construction, so it passes the hook floor's empty chain.
