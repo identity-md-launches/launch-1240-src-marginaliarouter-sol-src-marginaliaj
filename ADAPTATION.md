@@ -177,3 +177,39 @@ unchanged: still empty, still locking `hook = address(1)`, still making no exter
 
 Validation after this round: `forge build` passes (warnings only); `forge test --no-match-path 'test/fork/*'`
 passes every test; the two reviewer proofs pass from `test/scratch/`.
+
+## Revision round 3 (2026-10-10): reviewer findings
+
+Each finding was reproduced on the unchanged tree before anything changed (the reviewer's recipes, rebuilt in
+`test/scratch/Round3Repro.t.sol`, failed exactly as reported: leaderboard share 50.005 IMD for the self-priced
+venue, VoidSold with score -20,538 for the gifted SELL call, `sqrt(2) == 2`). `.imd-responses.json` carries the
+verdicts. Changes, by file:
+
+- `src/MarginaliaHook.sol` (`c7331916`, self-priced venue farms the leaderboard): `_difficulty` returns 0 for a
+  call whose venue is not the launch pool (v4, `ref == poolId`), so `settle` and `retract` book no score and no
+  `weekScore` for it, in either direction. The call still returns or forfeits its own deposit on price, still
+  counts in `right` / `wrong` / `broken` / `retracted`, and still takes the writer refund. Of the reviewer's three
+  options this is the only one that bounds the draw to zero: a capped multiple or a depth-derived tier still
+  leaves a RIGHT on a pool the author alone provisions free, and free rights dilute honest scores pro-rata
+  across any number of wallets. A venue policy that would let other canonical pools score again is the
+  requester's decision; there is no owner to set one.
+- `src/MarginaliaHook.sol` (`80c42ce7`, a gift voids a SELL call): the SELL hold rule is removed; `_broken` is
+  false for SELL calls, which settle on price alone. `balanceOf` cannot distinguish a buy-back from a stranger's
+  transfer, so every tolerance is a griefing price, not a guarantee. The BUY hold rule and its unverifiable-read
+  sentinel are unchanged. `SELL_HOLD_TOLERANCE_BPS` is gone. Hook runtime is 24,411 bytes, initcode 26,016.
+- `src/MarginaliaPricer.sol` (`4e3977e5`, advisory): `sqrt` returns 1 for inputs 1..3 before the loop; the
+  overflow-safe seed stays for the rest. One of the four deployed contracts, so fixed here.
+- Tests: `test/Round3Findings.t.sol` (the reviewer's two scenarios as regressions, plus: a wrong call and a
+  retraction on another venue book no score, a launch-pool call still scores and pays, a gift of any size does
+  not void a SELL call, a wrong SELL call still forfeits, a BUY call still breaks on a sale, `sqrt` exhaustive
+  over 0..1023 and fuzzed over `uint256`). `test/RevisionFindings.t.sol`: `testARealBuyBackStillVoidsASellCall`
+  encoded the removed rule and is now `testABuyBackNoLongerVoidsASellCallItSettlesOnPrice`;
+  `testARevertingBalanceOfVoidsTheCallAsSoldNotAsNoData` asserts score 0 (its venue is not the launch pool).
+- Docs: `SPEC.md` 4.3 (hold rule, score eligibility), 4.4 and section 10 rows; `README.md` leaderboard row,
+  audit history and known limits now state both rules as implemented.
+
+The four implementation constructors are unchanged: empty, locking `hook = address(1)`, no external calls.
+Validation after this round: `forge build --sizes` passes (warnings only); `forge test --no-match-path
+'test/fork/*'` passes every test (the fork suite still skips without `MAINNET_RPC_URL`); the unchanged supplied
+`Contracts.protected.t.sol` was run again from `test/scratch/` against the four rebuilt creation bytecodes with
+no constructor arguments on chain id 1 and passed.

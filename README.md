@@ -24,7 +24,7 @@ Every IMD accrual (stamps, sell fees, converted forfeits, treasury drips) splits
 
 | Share | Pool | Paid to |
 |---|---|---|
-| 50% | the week's leaderboard | every wallet with a positive net score from calls resolved that week, pro-rata by score, capped at 10% per wallet; `claimLeaderboard(week)` after the week ends |
+| 50% | the week's leaderboard | every wallet with a positive net score from calls resolved that week, pro-rata by score, capped at 10% per wallet; `claimLeaderboard(week)` after the week ends. Only calls priced on the launch pool book a score; a call on any other venue returns or forfeits its own deposit and scores nothing |
 | 30% | the week's thesis prize | the panel's top three long-form theses, 50/30/20, after `requestJudging(week)` and `payJudged(week)` |
 | 20% | the day's writer refund | every non-retracted note of the day, equal split, capped at one stamp; `claimRefund(id)` after the day ends |
 
@@ -40,7 +40,7 @@ except through the score, which is difficulty-weighted, netted against wrong cal
 3. Later hook launch (its manifest is produced separately): the factory deploys the token and the hook; the hook's constructor clones
    the three implementations and initialises each with itself in the same transaction.
 
-The hook's initcode is 25,469 bytes (EIP-3860 cap 49,152) and its runtime 23,864 bytes (EIP-170 cap 24,576);
+The hook's initcode is 26,016 bytes (EIP-3860 cap 49,152) and its runtime 24,411 bytes (EIP-170 cap 24,576);
 `forge build --sizes` is the gate for both.
 
 ## Build and test
@@ -111,8 +111,8 @@ pin the v4/hub extreme; sampled extremes do not measure prices between observati
 The second implementations review (2026-10-11) reopened the launch on eight reproduced findings; all are
 answered in `.imd-responses.json` and listed in `ADAPTATION.md`. In short: a price that rounds to zero is
 refused everywhere; forfeited MARG converts in tranches (`convertForfeits` sells the largest halving of the
-pot the pool absorbs); a stranger's dust cannot void a SELL call (a buy-back must exceed 10% of the post
-balance and the deposit's worth); an observation slot is never owned (a more adverse reading replaces the
+pot the pool absorbs); a stranger's dust cannot void a SELL call (a tolerance rule, since replaced by no SELL
+hold rule at all: see the third review below); an observation slot is never owned (a more adverse reading replaces the
 latest entry, so a one-block pump is overwritten next block); a note token whose `balanceOf` fails is "not
 held" (VoidSold, never a refundable void); an unobserved call scores as wrong though its deposit returns;
 a week holds at most 120 theses and refuses the 121st before taking anything; `abandonRequest` invalidates
@@ -120,6 +120,15 @@ an unanswered judging request after its deadline so a thesis pool is never swept
 answer; and an attestation must be about this chain. Two findings are disputed as design: any canonical
 Uniswap pool is a venue (an author can be its only participant: see the limits below), and the adverse
 extreme can be moved against a call by a paid round trip, which is the cost of the rule the launch asks for.
+
+The third review (2026-10-10) reopened the launch on the self-priced venue, now reproduced as a loss path
+(a wallet that is the only LP and trader of a hookless X/IMD pool settled a 100x call RIGHT at tier 3 and took
+the capped 10% of the week's leaderboard pool for one stamp), and on the residual of the SELL hold rule (a
+stranger's gift of the deposit's worth of X still voided a correct SELL call). Both are fixed: only a call
+priced on the launch pool books a score (a call on any other venue still returns or forfeits its own deposit
+and takes the writer refund, but books nothing and draws nothing from the leaderboard), and SELL calls have no
+hold rule at all (any balance-growth rule is a stranger's transfer away from voiding a correct call; the BUY
+hold rule is unchanged). The advisory `sqrt(2) == 2` is also fixed. See `ADAPTATION.md` and `.imd-responses.json`.
 
 ## v1 scope and known limits
 
@@ -135,9 +144,11 @@ extreme can be moved against a call by a paid round trip, which is the cost of t
 - The judge binds an answer to the Intake request it paid for and to this chain id; it does not recompute
   the oracle's canonical question hash (the eligible set can change after the request), so the Intake is
   trusted to deliver each answer under the request it was bought for.
-- Venue admission is "any canonical Uniswap pool with liquidity". An author who is the only LP and trader of
-  a hookless pool for a token it controls can price its own notes and choose the supply behind the score
-  tier; the leaderboard cap (10% of a week's pool per wallet) bounds, but does not remove, what such calls
-  draw. A depth, age or counterparty policy is a design decision for the requester (there is no owner).
+- Venue admission is "any canonical Uniswap pool with liquidity", and an author can be the only LP and trader
+  of such a pool. A call priced there therefore books no score and draws nothing from the leaderboard; it is a
+  bonded claim that returns or forfeits the author's own deposit on price. Only calls priced on the launch pool
+  (MARG/IMD under this hook) score. A depth, age or counterparty policy that would let other venues score is a
+  design decision for the requester (there is no owner).
+- SELL calls have no hold rule: they settle on price alone. BUY calls must keep their post balance.
 - The later hook launch must take the four implementation addresses as constructor arguments (verified on
   first use) rather than requiring their code at construction, so it passes the hook floor's empty chain.

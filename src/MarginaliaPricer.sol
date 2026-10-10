@@ -98,6 +98,7 @@ contract MarginaliaPricer {
 
     function sqrt(uint256 x) public pure returns (uint256 y) {
         if (x == 0) return 0;
+        if (x < 4) return 1; // the seed below equals x at x == 2, so the loop would not run (finding 4e3977e5)
         uint256 z = x / 2 + 1; // (x + 1) / 2 overflows at type(uint256).max
         y = x;
         while (z < y) {

@@ -139,15 +139,17 @@ contract RevisionFindingsTest is Fixture {
         assertEq(_rec(alice).broken, 0);
     }
 
-    function testARealBuyBackStillVoidsASellCall() public {
+    /// @dev Round 3 (finding 80c42ce7): the SELL hold rule is gone, because any balance-growth rule can be
+    /// triggered by a stranger's transfer. A buy-back no longer voids a SELL call; it settles on price alone.
+    function testABuyBackNoLongerVoidsASellCallItSettlesOnPrice() public {
         bytes32 id = _sellCall();
         uint256 postBalance = hook.noteOf(id).postBalance;
-        token.transfer(alice, postBalance / 5 + 10 ether); // well past 10% and the deposit's worth
+        token.transfer(alice, postBalance / 5 + 10 ether); // formerly "well past 10% and the deposit's worth"
         _observeThree(id);
         hook.settle(id);
-        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidSold));
-        assertEq(_rec(alice).broken, 1);
-        assertEq(hook.noteOf(id).deposit, 0);
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Right));
+        assertEq(_rec(alice).broken, 0);
+        assertGt(hook.noteOf(id).deposit, 0);
     }
 
     // ---------------------------------------------------------------- 7fa6bcfb: a squatter cannot own the series
@@ -204,7 +206,9 @@ contract RevisionFindingsTest is Fixture {
         hook.settle(id);
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidSold));
         assertEq(hook.noteOf(id).deposit, 0);
-        assertLt(_rec(alice).score, 0);
+        assertEq(_rec(alice).broken, 1);
+        // Round 3 (finding c7331916): a call priced off the launch pool books no score in either direction.
+        assertEq(_rec(alice).score, 0);
     }
 
     // ---------------------------------------------------------------- 7539406d: theses past the judged cap are refused

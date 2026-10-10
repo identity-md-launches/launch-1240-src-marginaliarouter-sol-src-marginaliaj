@@ -59,9 +59,6 @@ contract MarginaliaHook is IUnlockCallback {
     /// @dev A week's theses are capped at what the judge can put in front of the panel (its MAX_JUDGED), and a
     /// thesis past the cap is refused before its stamp and deposit are taken, never silently unjudgeable.
     uint256 public constant MAX_WEEK_THESES = 120;
-    /// @dev A SELL call is void only if the author's balance grows by more than this share of its post balance
-    /// (and by more than the deposit's worth of X): a stranger's dust transfer cannot void it.
-    uint256 public constant SELL_HOLD_TOLERANCE_BPS = 1000;
     /// @dev Gas allowed to a note token's balanceOf during an observation; a read that fails is "not held".
     uint256 public constant BALANCE_READ_GAS = 100_000;
     uint256 public constant JUDGE_THRESHOLD = 2 ether; // IMD, in the week's thesis pot
@@ -524,16 +521,13 @@ contract MarginaliaHook is IUnlockCallback {
         return abi.decode(ret, (uint256));
     }
 
-    /// @dev Whether an observed balance breaks the hold rule: a BUY call must keep its post balance; a SELL
-    /// call must not grow it by more than SELL_HOLD_TOLERANCE_BPS and the deposit's worth of X, so only a
-    /// buy-back of real size, not a stranger's dust, voids it. The unverifiable sentinel breaks either.
+    /// @dev Whether an observed balance breaks the hold rule: a BUY call must keep its post balance (the
+    /// unverifiable sentinel counts as not held). A SELL call has no hold rule and settles on price alone: an
+    /// ERC-20 balance can be raised by anyone, so any "must not grow" rule lets a stranger void a correct call
+    /// with a gift (revision finding 80c42ce7).
     function _broken(T.Note storage n, uint256 balance) private view returns (bool) {
-        if (balance == type(uint256).max) return true;
-        if (n.side == T.Side.Buy) return balance < n.postBalance;
-        uint256 tolerance = n.postBalance * SELL_HOLD_TOLERANCE_BPS / 10_000;
-        uint256 depositWorth = FullMath.mulDiv(DEPOSIT, 1e18, n.postPrice);
-        if (depositWorth > tolerance) tolerance = depositWorth;
-        return balance > n.postBalance + tolerance;
+        if (n.side == T.Side.Sell) return false;
+        return balance == type(uint256).max || balance < n.postBalance;
     }
 
     /// @dev Whether a reading is more adverse to the call than the one it would replace: a worse price (v4:
@@ -685,8 +679,12 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ score
 
-    /// @dev log2(claimed multiple) x sqrt(30 / horizon) x mcap tier, scaled 1e4 (MarginaliaPricer).
+    /// @dev log2(claimed multiple) x sqrt(30 / horizon) x mcap tier, scaled 1e4 (MarginaliaPricer). Only a call
+    /// priced on the launch pool scores: on any other canonical venue the author can be the only LP and trader,
+    /// choose the price, the multiple and the supply behind the tier, and draw on the leaderboard pool for a
+    /// stamp (revision finding c7331916). Such calls still return or forfeit their own deposit on price.
     function _difficulty(T.Note storage n) private view returns (uint256) {
+        if (n.venue.kind != T.VenueKind.UniV4 || n.venue.ref != PoolId.unwrap(poolId)) return 0;
         uint256 mcap = FullMath.mulDiv(n.postPrice, IERC20(n.x).totalSupply(), 1e18);
         return pricer().difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
     }
