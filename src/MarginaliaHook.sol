@@ -23,6 +23,7 @@ import {MarginaliaTreasury} from "./MarginaliaTreasury.sol";
 import {MarginaliaRouter} from "./MarginaliaRouter.sol";
 import {MarginaliaJudge} from "./MarginaliaJudge.sol";
 import {MarginaliaImpls} from "./MarginaliaImpls.sol";
+import {MarginaliaMath} from "./MarginaliaMath.sol";
 import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /// @title Marginalia: notes in the margin of every trade
@@ -63,9 +64,6 @@ contract MarginaliaHook is IUnlockCallback {
     uint256 public constant SWEEP_AFTER = 28 days; // unclaimed pools roll forward after this
     uint256 public constant LP_FEE = 12_500;
 
-    /// @dev IMD-denominated market-cap tiers for the difficulty score (~$1M / ~$10M at IMD ≈ $9).
-    uint256 public constant TIER2_MCAP_IMD = 111_000 ether;
-    uint256 public constant TIER3_MCAP_IMD = 1_110_000 ether;
 
     /// @dev The IMD oracle (Ethereum mainnet and Robinhood Chain share these addresses).
     address public constant INTAKE = 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56;
@@ -106,7 +104,7 @@ contract MarginaliaHook is IUnlockCallback {
         uint32 judgedWins;
     }
 
-    mapping(address => Record) private records;
+    mapping(address => Record) public records;
 
     // ------------------------------------------------------------------ pot and judging
 
@@ -122,7 +120,7 @@ contract MarginaliaHook is IUnlockCallback {
     mapping(uint32 => mapping(address => int256)) public weekScore;
     mapping(uint32 => uint256) public weekTotal;
     mapping(uint32 => mapping(address => bool)) public leaderboardClaimed;
-    mapping(uint32 => uint256) public leaderboardSwept;
+    mapping(uint32 => uint256) public leaderboardPaid;
     mapping(uint32 => uint32) public notesPerDay;
     mapping(bytes32 => bool) public refundClaimed;
     mapping(uint32 => bytes32[]) private weekTheses;
@@ -190,15 +188,16 @@ contract MarginaliaHook is IUnlockCallback {
     // ------------------------------------------------------------------ construction
 
     constructor(IPoolManager poolManager_, address token_, address factory_) {
-        require(
-            address(poolManager_).code.length > 0 && token_.code.length > 0 && factory_ != address(0),
-            "configuration required"
-        );
+        if (address(poolManager_).code.length == 0 || token_.code.length == 0 || factory_ == address(0)) revert InvalidUnlock();
         poolManager = poolManager_;
         token = token_;
         factory = factory_;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
         // Companions are EIP-1167 clones of audited implementations, initialised here and never again.
+        if (
+            MarginaliaImpls.TREASURY_IMPL.code.length == 0 || MarginaliaImpls.ROUTER_IMPL.code.length == 0
+                || MarginaliaImpls.JUDGE_IMPL.code.length == 0 || MarginaliaImpls.MATH.code.length == 0
+        ) revert InvalidUnlock();
         MarginaliaTreasury t = MarginaliaTreasury(payable(Clones.clone(MarginaliaImpls.TREASURY_IMPL)));
         t.init(address(this));
         treasury = t;
@@ -329,7 +328,7 @@ contract MarginaliaHook is IUnlockCallback {
             poolManager.mint(address(this), _id(token), depositMarg);
             _accrue(STAMP);
             (T.NoteParams memory p, address author, uint256 xResult) = _decodeNote(data);
-            _postNote(author, p, xResult, depositMarg);
+            _postNote(author, p, xResult, depositMarg, margOut - depositMarg);
             emit SwapFee(true, author, poolImd, 0, STAMP);
             return (IHooks.afterSwap.selector, depositMarg.toInt128());
         }
@@ -345,7 +344,7 @@ contract MarginaliaHook is IUnlockCallback {
             poolManager.mint(address(this), _id(token), depositMarg);
             _accrue(fee);
             (T.NoteParams memory p, address author, uint256 xResult) = _decodeNote(data);
-            _postNote(author, p, xResult, depositMarg);
+            _postNote(author, p, xResult, depositMarg, 0);
             emit SwapFee(false, author, poolImd, fee - STAMP, STAMP);
             return (IHooks.afterSwap.selector, fee.toInt128());
         }
@@ -388,7 +387,9 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ notes
 
-    function _postNote(address author, T.NoteParams memory p, uint256 xResult, uint256 depositMarg) private {
+    function _postNote(address author, T.NoteParams memory p, uint256 xResult, uint256 depositMarg, uint256 margToAuthor)
+        private
+    {
         bool thesis = p.targetBps == 0;
         uint256 textLen = bytes(p.text).length;
         if (thesis) {
@@ -404,7 +405,7 @@ contract MarginaliaHook is IUnlockCallback {
             if (p.x == address(0) || p.x.code.length == 0) revert InvalidNote();
         }
         uint8 class = p.class;
-        if (class > uint8(T.Class.Attested)) revert InvalidNote();
+        if (class >= uint8(T.Class.Attested)) revert InvalidNote(); // the panel's class is never self-declared
         if (xResult > 0) class = uint8(T.Class.Traded);
         else if (class == uint8(T.Class.Traded)) class = uint8(T.Class.Declared);
         if (author.code.length > 0) class = uint8(T.Class.Agent);
@@ -429,7 +430,8 @@ contract MarginaliaHook is IUnlockCallback {
             if (weekTheses[_week()].length < MAX_DAY_NOTES) weekTheses[_week()].push(id);
         } else {
             n.postPrice = _priceInImd(p.venue);
-            n.postBalance = IERC20(p.x).balanceOf(author);
+            // The MARG this very swap delivers reaches the author after the callback; count it for a note on MARG.
+            n.postBalance = IERC20(p.x).balanceOf(author) + (p.x == token ? margToAuthor : 0);
             if (p.parentId != bytes32(0)) {
                 T.Note storage parent = notes[p.parentId];
                 if (parent.author != author || parent.status != T.Status.ThesisOpen) revert InvalidNote();
@@ -499,7 +501,7 @@ contract MarginaliaHook is IUnlockCallback {
                     held = false;
                 }
             }
-            settlePrice = _median(prices);
+            settlePrice = MarginaliaMath(MarginaliaImpls.MATH).median(prices);
             if (!held) {
                 outcome = T.Status.VoidSold;
             } else if (n.side == T.Side.Buy) {
@@ -569,11 +571,16 @@ contract MarginaliaHook is IUnlockCallback {
         if (amount == 0) revert NothingToClaim();
         n.deposit = 0;
         if (asImd) {
-            _unlock(ACT_SELL, n.author, amount, 0);
+            _unlock(ACT_SELL, n.author, amount, _minImdOut(amount));
         } else {
             _unlock(ACT_PAY, n.author, amount, uint256(uint160(token)));
         }
         emit DepositClaimed(id, n.author, asImd, amount);
+    }
+
+    /// @dev 97% of the pre-swap spot: a bound on what one sale may lose to a sandwich, not a market guarantee.
+    function _minImdOut(uint256 marg) private view returns (uint256) {
+        return FullMath.mulDiv(marg, margPriceInImd(), 1e18) * 97 / 100;
     }
 
     function _forfeit(T.Note storage n, address keeper) private {
@@ -597,57 +604,10 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ score
 
-    /// @dev log2(claimed multiple) × sqrt(30 / horizon) × mcap tier, scaled 1e4.
+    /// @dev log2(claimed multiple) x sqrt(30 / horizon) x mcap tier, scaled 1e4 (MarginaliaMath).
     function _difficulty(T.Note storage n) private view returns (uint256) {
-        uint256 ratio = n.side == T.Side.Buy ? n.targetBps : FullMath.mulDiv(10_000, 10_000, n.targetBps);
-        uint256 l2 = _log2x1e4(ratio); // 1e4 scaled bits
-        uint256 s = _sqrt(FullMath.mulDiv(30, 1e8, n.horizonDays)); // sqrt(30/h) × 1e4
         uint256 mcap = FullMath.mulDiv(n.postPrice, IERC20(n.x).totalSupply(), 1e18);
-        uint256 tier = mcap >= TIER3_MCAP_IMD ? 3 : (mcap >= TIER2_MCAP_IMD ? 2 : 1);
-        return FullMath.mulDiv(l2, s, 1e4) * tier;
-    }
-
-    /// @dev log2 of a ratio given ×1e4 (ratio ≥ 1e4), returned ×1e4 with 1/16 precision.
-    function _log2x1e4(uint256 r) private pure returns (uint256 result) {
-        uint256 n;
-        while (r >= 20_000) {
-            r /= 2;
-            n += 1;
-        }
-        result = n * 1e4;
-        uint256 frac = 5000;
-        for (uint256 i = 0; i < 4; ++i) {
-            r = r * r / 1e4;
-            if (r >= 20_000) {
-                result += frac;
-                r /= 2;
-            }
-            frac /= 2;
-        }
-    }
-
-    function _sqrt(uint256 x) private pure returns (uint256 y) {
-        if (x == 0) return 0;
-        uint256 z = (x + 1) / 2;
-        y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-    }
-
-    function _median(uint256[] memory a) private pure returns (uint256) {
-        uint256 n = a.length;
-        for (uint256 i = 1; i < n; ++i) {
-            uint256 v = a[i];
-            uint256 j = i;
-            while (j > 0 && a[j - 1] > v) {
-                a[j] = a[j - 1];
-                --j;
-            }
-            a[j] = v;
-        }
-        return n % 2 == 1 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
+        return MarginaliaMath(MarginaliaImpls.MATH).difficulty(n.targetBps, n.side == T.Side.Buy, n.horizonDays, mcap);
     }
 
     // ------------------------------------------------------------------ pot and judging
@@ -668,6 +628,7 @@ contract MarginaliaHook is IUnlockCallback {
         return _week();
     }
 
+    /// @notice Every thesis posted in a week, by posting order (the judge filters to those with a child call).
     function thesesOfWeek(uint32 w) external view returns (bytes32[] memory) {
         return weekTheses[w];
     }
@@ -696,23 +657,25 @@ contract MarginaliaHook is IUnlockCallback {
         if (msg.sender != address(judge)) revert Unauthorized();
         if (amount == 0 || amount > potMarg) revert PotTooSmall();
         potMarg -= amount;
-        imdOut = _unlock(ACT_SELL, address(0), amount, 0);
+        imdOut = _unlock(ACT_SELL, address(0), amount, _minImdOut(amount));
         _accrue(imdOut);
         emit PotMargSold(amount, imdOut, _today());
     }
 
-    /// @notice The judge draws the oracle's price out of a week's thesis pool.
-    function drawForJudging(uint32 w, uint256 amount) external {
+    /// @notice The judge draws the oracle's price out of a week's thesis pool. The first draw of a week needs
+    /// the threshold; a retry after an unanswered request only needs the price.
+    function drawForJudging(uint32 w, uint256 amount, bool retry) external {
         if (msg.sender != address(judge)) revert Unauthorized();
-        if (thesisPool[w] < JUDGE_THRESHOLD || amount > thesisPool[w]) revert PotTooSmall();
+        uint256 need = retry ? amount : JUDGE_THRESHOLD;
+        if (thesisPool[w] < need || amount > thesisPool[w]) revert PotTooSmall();
         thesisPool[w] -= amount;
         _unlock(ACT_PAY, address(judge), amount, uint256(uint160(imd)));
     }
 
     /// @notice Who wrote a note and in which week: what the judge needs to filter the panel's ranking.
-    function noteMeta(bytes32 id) external view returns (address author, uint32 w, bool thesis) {
+    function noteMeta(bytes32 id) external view returns (address author, uint32 w, bool thesis, bool hasChild) {
         T.Note storage n = notes[id];
-        return (n.author, uint32(uint256(n.postedAt) / 7 days), n.targetBps == 0);
+        return (n.author, uint32(uint256(n.postedAt) / 7 days), n.targetBps == 0, n.children > 0);
     }
 
     /// @notice Pays a judged week's thesis pool 50/30/20 to the ranked authors. The judge supplies the ranking.
@@ -753,7 +716,7 @@ contract MarginaliaHook is IUnlockCallback {
         uint256 amount = leaderboardShare(w, msg.sender);
         if (amount == 0) revert NothingToClaim();
         leaderboardClaimed[w][msg.sender] = true;
-        leaderboardSwept[w] += amount;
+        leaderboardPaid[w] += amount;
         _unlock(ACT_PAY, msg.sender, amount, uint256(uint160(imd)));
         emit LeaderboardClaimed(w, msg.sender, amount);
     }
@@ -775,21 +738,27 @@ contract MarginaliaHook is IUnlockCallback {
         emit RefundClaimed(id, msg.sender, amount);
     }
 
-    /// @notice Rolls what a day's refund pool or a week's leaderboard pool left unclaimed into the current one.
+    /// @notice Rolls what an old pool left unclaimed into the current week's leaderboard pool, where it reaches
+    /// writers. kind 0 = a day's refund pool, 1 = a week's leaderboard pool, 2 = a week's thesis pool (only once
+    /// the judge confirms nothing is pending or judged for it). A swept pool is zeroed, so no claim can draw on it.
     function sweep(uint8 kind, uint32 epoch) external {
         uint256 amount;
         if (kind == 0) {
             if (block.timestamp < (uint256(epoch) + 1) * 1 days + SWEEP_AFTER) revert TooEarly();
             amount = refundPool[epoch];
             refundPool[epoch] = 0;
-            refundPool[_today()] += amount;
+        } else if (kind == 1) {
+            if (block.timestamp < (uint256(epoch) + 1) * 7 days + SWEEP_AFTER) revert TooEarly();
+            amount = leaderboardPool[epoch] - leaderboardPaid[epoch];
+            leaderboardPool[epoch] = 0;
         } else {
             if (block.timestamp < (uint256(epoch) + 1) * 7 days + SWEEP_AFTER) revert TooEarly();
-            amount = leaderboardPool[epoch] - leaderboardSwept[epoch];
-            leaderboardSwept[epoch] = leaderboardPool[epoch];
-            leaderboardPool[_week()] += amount;
+            if (!judge.weekClosed(epoch)) revert NotOpen();
+            amount = thesisPool[epoch];
+            thesisPool[epoch] = 0;
         }
         if (amount == 0) revert NothingToSweep();
+        leaderboardPool[_week()] += amount;
         emit Swept(kind, epoch, amount);
     }
 
@@ -839,8 +808,11 @@ contract MarginaliaHook is IUnlockCallback {
             int128 margDelta = imdIs0 ? delta.amount1() : delta.amount0();
             int128 imdDelta = imdIs0 ? delta.amount0() : delta.amount1();
             if (margDelta >= 0 || imdDelta <= 0) revert InvalidUnlock();
-            poolManager.burn(address(this), _id(token), uint256(uint128(-margDelta)));
+            // Whole fill only, and at least `extra` IMD out (the caller's slippage floor), never an orphaned claim.
+            if (uint256(uint128(-margDelta)) != amount) revert InvalidUnlock();
+            poolManager.burn(address(this), _id(token), amount);
             uint256 imdOut = uint256(uint128(imdDelta));
+            if (imdOut < extra) revert InvalidUnlock();
             if (to == address(0)) {
                 poolManager.mint(address(this), _id(imd), imdOut);
             } else {
@@ -862,7 +834,4 @@ contract MarginaliaHook is IUnlockCallback {
         return _note(id);
     }
 
-    function recordOf(address wallet) external view returns (Record memory) {
-        return records[wallet];
-    }
 }

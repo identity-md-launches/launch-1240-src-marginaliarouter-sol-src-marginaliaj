@@ -20,6 +20,7 @@ import {ILaunchFactory} from "../../src/interfaces/ILaunchFactory.sol";
 import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
 import {MarginaliaTreasury} from "../../src/MarginaliaTreasury.sol";
 import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
+import {MarginaliaMath} from "../../src/MarginaliaMath.sol";
 
 /// @notice The rehearsal: the real IMD LaunchFactory on a mainnet fork, impersonating its launch wallet,
 /// deploys Marginalia exactly as a protocol launch would, then a user posts a note through the router.
@@ -78,6 +79,7 @@ contract MainnetLaunchTest is Test {
         vm.etch(MarginaliaImpls.ROUTER_IMPL, address(new MarginaliaRouter()).code);
         vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
         vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
+        vm.etch(MarginaliaImpls.MATH, address(new MarginaliaMath()).code);
         bytes memory tokenCode = type(Marginalia).creationCode;
         address predictedToken = FACTORY.predictToken(LAUNCH_NUMBER, tokenCode);
         bytes memory hookCode =
@@ -192,7 +194,7 @@ contract MainnetLaunchTest is Test {
         p.class = uint8(T.Class.Declared);
         p.text = "IMD -30% in 14d: launch-night sells into a thin hub";
         uint256 ethBefore = alice.balance;
-        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        router.tradeAndNote(x, p, hub, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
         assertGt(alice.balance, ethBefore, "received ETH for the IMD sold");
         T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
@@ -201,10 +203,10 @@ contract MainnetLaunchTest is Test {
         assertEq(n.postBalance, IERC20(IMD).balanceOf(alice));
         // a traded note about a token other than the one traded is refused
         p.x = address(token);
-        p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(key.toId()), IMD, address(token) < IMD);
+        p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(key.toId()), address(0), false);
         vm.startPrank(alice);
         vm.expectRevert(MarginaliaRouter.NoteTokenMismatch.selector);
-        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        router.tradeAndNote(x, p, key, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
     }
 
@@ -245,7 +247,7 @@ contract MainnetLaunchTest is Test {
             "LINK 1.5x in 30d: CCIP volume"
         );
         uint256 linkBefore = IERC20(LINK).balanceOf(alice);
-        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        router.tradeAndNote(x, p, noKey, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
         T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
         assertGt(IERC20(LINK).balanceOf(alice), linkBefore, "bought LINK");
@@ -272,7 +274,7 @@ contract MainnetLaunchTest is Test {
             UNI, T.Venue(T.VenueKind.UniV2, bytes32(uint256(uint160(pair))), WETH, UNI < WETH), 12_000, 14, "UNI +20% in 14d: fee switch"
         );
         uint256 uniBefore = IERC20(UNI).balanceOf(alice);
-        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        router.tradeAndNote(x, p, noKey, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
         T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
         assertGt(IERC20(UNI).balanceOf(alice), uniBefore, "bought UNI");
@@ -280,11 +282,11 @@ contract MainnetLaunchTest is Test {
         assertEq(n.x, UNI);
         assertGt(n.postPrice, 0);
         emit log_named_uint("UNI price in IMD (1e18)", n.postPrice);
-        // the wrong subject is refused on the v2 path too
+        // the wrong subject is refused on the v2 path too (the venue check fires first: the UNI pair has no LINK)
         p.x = LINK;
         vm.startPrank(alice);
-        vm.expectRevert(MarginaliaRouter.NoteTokenMismatch.selector);
-        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        vm.expectRevert(MarginaliaRouter.BadVenue.selector);
+        router.tradeAndNote(x, p, noKey, 5 ether, 1, block.timestamp + 1);
         vm.stopPrank();
     }
 
@@ -296,12 +298,13 @@ contract MainnetLaunchTest is Test {
         T.NoteParams memory p;
         p.x = IMD;
         p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
+        PoolKey memory hubKey = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
         p.side = T.Side.Buy;
         p.targetBps = 15_000;
         p.horizonDays = 30;
         p.class = uint8(T.Class.Declared);
         p.text = "IMD 1.5x in 30d: the hackathon launches are IMD-paired and every note here is an IMD buy";
-        uint256 received = router.note(p, 20 ether, 1, block.timestamp + 1);
+        uint256 received = router.note(p, hubKey, 20 ether, 1, block.timestamp + 1);
         vm.stopPrank();
         bytes32 id = bytes32(hook.noteCount());
         T.Note memory n = hook.noteOf(id);

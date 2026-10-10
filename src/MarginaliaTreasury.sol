@@ -9,9 +9,9 @@ interface IHookPot {
     function fundPot(uint256 amount) external;
 }
 
-/// @notice Holds what the project is given (prize money, the launch remainder, gifts) and drips 2% of its
-/// IMD into the hook's pot once a day. No owner, no withdraw. ETH and other tokens wait for a sweep
-/// (v1: anyone may hand IMD in; conversions of other assets are a documented follow-up).
+/// @notice Holds what the project is given in IMD (prize money, the launch remainder, gifts) and drips 2% of
+/// it into the hook's pools once a day. No owner, no withdraw. It refuses ETH, and other tokens sent here are
+/// unreachable: send IMD.
 contract MarginaliaTreasury {
     using SafeERC20 for IERC20;
 
@@ -24,17 +24,16 @@ contract MarginaliaTreasury {
     error AlreadyInitialised();
 
     event Dripped(uint32 indexed day, uint256 amount);
-    event Received(address indexed from, uint256 amount);
 
-    /// @dev Called once by the hook on its clone, in the hook's constructor.
+    /// @dev The implementation locks itself; only clones (zero storage) can be initialised, once, by the hook.
+    constructor() {
+        hook = IHookPot(address(1));
+    }
+
     function init(address hook_) external {
         if (address(hook) != address(0)) revert AlreadyInitialised();
         require(hook_ != address(0), "configuration required");
         hook = IHookPot(hook_);
-    }
-
-    receive() external payable {
-        emit Received(msg.sender, msg.value);
     }
 
     /// @notice Anyone, once per UTC day: 2% of the IMD balance into today's pot.

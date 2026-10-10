@@ -7,6 +7,22 @@ import {MarginaliaJudge} from "../src/MarginaliaJudge.sol";
 import {MarginaliaTypes as T} from "../src/MarginaliaTypes.sol";
 import {OracleAttestation} from "../src/OracleAttestation.sol";
 import {HookFlags} from "../src/HookFlags.sol";
+import {MarginaliaRouter} from "../src/MarginaliaRouter.sol";
+
+/// @dev A contract that answers slot0() with whatever it likes: the self-priced venue the audit proved.
+contract FakePool {
+    address public token0;
+    address public token1;
+    uint24 public fee = 3000;
+
+    constructor(address a, address b) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+    }
+
+    function slot0() external pure returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
+        return (uint160(1) << 100, 0, 0, 0, 0, 0, true);
+    }
+}
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
 contract LifecycleTest is Fixture {
@@ -59,14 +75,14 @@ contract LifecycleTest is Fixture {
         T.NoteParams memory p = _margNote(T.Side.Buy, 20_000, 7, "tiny");
         vm.prank(alice);
         vm.expectRevert();
-        router.note(p, 0.15 ether, 1, block.timestamp + 1);
+        router.note(p, key, 0.15 ether, 1, block.timestamp + 1);
     }
 
     function testUpOnlyIsRefused() public {
         T.NoteParams memory p = _margNote(T.Side.Buy, 10_500, 7, "up");
         vm.prank(alice);
         vm.expectRevert();
-        router.note(p, 10 ether, 1, block.timestamp + 1);
+        router.note(p, key, 10 ether, 1, block.timestamp + 1);
     }
 
     function testQuietSellPaysThreePercent() public {
@@ -85,7 +101,7 @@ contract LifecycleTest is Fixture {
         uint256 claimsBefore = _claims(address(hook), address(token));
         T.NoteParams memory p = _margNote(T.Side.Sell, 7000, 14, "MARG -30%: airdrop supply still unwinding");
         vm.prank(bob);
-        uint256 out = router.sellWithNote(p, 100 ether, 1, block.timestamp + 1);
+        uint256 out = router.sellWithNote(p, key, 100 ether, 1, block.timestamp + 1);
         bytes32 id = bytes32(hook.noteCount());
         T.Note memory n = hook.noteOf(id);
         assertEq(n.author, bob);
@@ -119,7 +135,7 @@ contract LifecycleTest is Fixture {
         hook.settle(id);
         T.Note memory n = hook.noteOf(id);
         assertEq(uint8(n.status), uint8(T.Status.Right));
-        MarginaliaHook.Record memory r = hook.recordOf(alice);
+        MarginaliaHook.Record memory r = _rec(alice);
         assertEq(r.right, 1);
         assertGt(r.score, 0);
         uint256 imdBefore = imd.balanceOf(alice);
@@ -145,7 +161,7 @@ contract LifecycleTest is Fixture {
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Wrong));
         assertEq(token.balanceOf(carol), deposit * 200 / 10_000);
         assertEq(hook.potMarg(), deposit - deposit * 200 / 10_000);
-        assertLt(hook.recordOf(alice).score, 0);
+        assertLt(_rec(alice).score, 0);
         vm.prank(alice);
         vm.expectRevert(MarginaliaHook.NothingToClaim.selector);
         hook.claimDeposit(id, false);
@@ -164,7 +180,7 @@ contract LifecycleTest is Fixture {
         vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
         hook.settle(id);
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidSold));
-        assertEq(hook.recordOf(alice).broken, 1);
+        assertEq(_rec(alice).broken, 1);
     }
 
     function testNoDataRefunds() public {
@@ -173,7 +189,7 @@ contract LifecycleTest is Fixture {
         vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
         hook.settle(id);
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.VoidNoData));
-        assertEq(hook.recordOf(alice).score, 0);
+        assertEq(_rec(alice).score, 0);
         uint256 before = token.balanceOf(alice);
         vm.prank(alice);
         hook.claimDeposit(id, false);
@@ -190,8 +206,8 @@ contract LifecycleTest is Fixture {
         hook.retract(id, "thesis dead: the dev sold");
         assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Retracted));
         assertEq(hook.potMarg(), deposit);
-        assertLt(hook.recordOf(alice).score, 0);
-        assertEq(hook.recordOf(alice).retracted, 1);
+        assertLt(_rec(alice).score, 0);
+        assertEq(_rec(alice).retracted, 1);
     }
 
     function testThesisParentChild() public {
@@ -233,11 +249,16 @@ contract LifecycleTest is Fixture {
         uint32 w = hook.week();
         (bytes32 a1,) = _note(alice, _margNote(T.Side.Buy, 0, 0, "thesis A: cited, argued"), 10 ether);
         (bytes32 b1,) = _note(bob, _margNote(T.Side.Buy, 0, 0, "thesis B: shorter"), 10 ether);
-        (bytes32 call1,) = _note(alice, _margNote(T.Side.Buy, 20_000, 7, "a short call, never judged"), 10 ether);
+        T.NoteParams memory ca = _margNote(T.Side.Buy, 20_000, 7, "alice's child call");
+        ca.parentId = a1;
+        (bytes32 call1,) = _note(alice, ca, 10 ether);
+        T.NoteParams memory cb = _margNote(T.Side.Buy, 20_000, 7, "bob's child call");
+        cb.parentId = b1;
+        _note(bob, cb, 10 ether);
         vm.prank(alice);
         hook.fundPot(20 ether); // 30% of this lands in the thesis pool
         assertEq(hook.thesesOfWeek(w).length, 2);
-        assertEq(hook.thesisPool(w), (20 ether + 3 * hook.STAMP()) * 30 / 100);
+        assertEq(hook.thesisPool(w), (20 ether + 4 * hook.STAMP()) * 30 / 100);
         vm.expectRevert();
         judge.requestJudging(w); // week not over
         vm.warp(block.timestamp + 7 days);
@@ -319,12 +340,76 @@ contract LifecycleTest is Fixture {
         vm.prank(alice);
         vm.expectRevert(MarginaliaHook.NothingToClaim.selector);
         hook.claimLeaderboard(w);
-        // the unclaimed 90% rolls forward after the sweep delay
+        // the unclaimed 90% rolls forward after the sweep delay, and nothing can be claimed from the swept week
         vm.expectRevert(MarginaliaHook.TooEarly.selector);
         hook.sweep(1, w);
         vm.warp(block.timestamp + hook.SWEEP_AFTER());
         hook.sweep(1, w);
         assertEq(hook.leaderboardPool(hook.week()), pool - pool * 10 / 100);
+        assertEq(hook.leaderboardPool(w), 0);
+        assertEq(hook.leaderboardShare(w, alice), 0);
+    }
+
+    function testFakeVenueIsRefused() public {
+        // a note priced by a contract the author controls is refused by the router before anything is pulled
+        T.NoteParams memory p = _margNote(T.Side.Buy, 20_000, 7, "self-priced");
+        address fake = address(new FakePool(address(token), address(imd)));
+        p.venue = T.Venue(T.VenueKind.UniV3, bytes32(uint256(uint160(fake))), address(0), false);
+        vm.prank(alice);
+        vm.expectRevert();
+        router.note(p, key, 10 ether, 1, block.timestamp + 1);
+        // a v4 id that does not match the key is refused too
+        p = _margNote(T.Side.Buy, 20_000, 7, "wrong id");
+        p.venue.ref = bytes32(uint256(1));
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaRouter.BadVenue.selector);
+        router.note(p, key, 10 ether, 1, block.timestamp + 1);
+        // a note about a token the pool does not contain is refused
+        p = _margNote(T.Side.Buy, 20_000, 7, "not in pool");
+        p.x = address(0xBEEF);
+        vm.etch(address(0xBEEF), hex"00");
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaRouter.BadVenue.selector);
+        router.note(p, key, 10 ether, 1, block.timestamp + 1);
+    }
+
+    function testAttestedClassCannotBeSelfDeclared() public {
+        T.NoteParams memory p = _margNote(T.Side.Buy, 20_000, 7, "attested?");
+        p.class = uint8(T.Class.Attested);
+        vm.prank(alice);
+        vm.expectRevert();
+        router.note(p, key, 10 ether, 1, block.timestamp + 1);
+    }
+
+    function testUnansweredWeekCanBeRetried() public {
+        uint32 w = hook.week();
+        (bytes32 tid,) = _note(alice, _margNote(T.Side.Buy, 0, 0, "thesis"), 10 ether);
+        T.NoteParams memory child = _margNote(T.Side.Buy, 11_000, 1, "child");
+        child.parentId = tid;
+        _note(alice, child, 10 ether);
+        vm.prank(alice);
+        hook.fundPot(20 ether);
+        vm.warp(block.timestamp + 7 days);
+        judge.requestJudging(w);
+        vm.expectRevert(MarginaliaJudge.AlreadyRequested.selector);
+        judge.requestJudging(w);
+        assertFalse(judge.weekClosed(w));
+        vm.warp(block.timestamp + judge.ANSWER_DEADLINE() + 1);
+        bytes32 second = judge.requestJudging(w); // the panel never answered: retry, paying only the price
+        assertTrue(second != bytes32(0));
+    }
+
+    function testQuietThesisPoolSweeps() public {
+        uint32 w = hook.week();
+        vm.prank(alice);
+        hook.fundPot(10 ether); // 3 IMD into this week's thesis pool, no theses posted
+        uint256 pot = hook.thesisPool(w);
+        assertGt(pot, 0);
+        vm.warp((uint256(w) + 1) * 7 days + hook.SWEEP_AFTER() + 1);
+        assertTrue(judge.weekClosed(w));
+        hook.sweep(2, w);
+        assertEq(hook.thesisPool(w), 0);
+        assertEq(hook.leaderboardPool(hook.week()), pot);
     }
 
     function testWriterRefundCappedAtStamp() public {

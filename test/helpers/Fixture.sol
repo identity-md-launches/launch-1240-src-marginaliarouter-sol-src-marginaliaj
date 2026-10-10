@@ -22,6 +22,7 @@ import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
 import {HookFlags} from "../../src/HookFlags.sol";
 import {MarginaliaTypes as T} from "../../src/MarginaliaTypes.sol";
 import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
+import {MarginaliaMath} from "../../src/MarginaliaMath.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {IIntake} from "../../src/interfaces/IIntake.sol";
 
@@ -149,9 +150,14 @@ abstract contract Fixture is Test {
 
     /// @dev The implementations live at fixed addresses the hook clones from; put real code there.
     function _etchImpls() internal {
+        // An implementation locks itself in its constructor, so it can never be hijacked by a stray init.
+        MarginaliaTreasury impl = new MarginaliaTreasury();
+        vm.expectRevert(MarginaliaTreasury.AlreadyInitialised.selector);
+        impl.init(address(this));
         vm.etch(MarginaliaImpls.ROUTER_IMPL, address(new MarginaliaRouter()).code);
         vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
         vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
+        vm.etch(MarginaliaImpls.MATH, address(new MarginaliaMath()).code);
     }
 
     function _deployHook(IPoolManager m, address t) internal returns (MarginaliaHook result) {
@@ -212,6 +218,9 @@ abstract contract Fixture is Test {
         // The oracle stand-ins live at the hook's hardcoded mainnet addresses.
         vm.etch(hook.INTAKE(), address(new MockIntake()).code);
         vm.etch(hook.ORACLE_SIGNER(), address(new MockSigner()).code);
+        // Cloned companions: etched implementations above, and the clones must not be re-initialisable.
+        vm.expectRevert(MarginaliaRouter.AlreadyInitialised.selector);
+        router.init(manager, address(this));
     }
 
     function _margNote(T.Side side, uint32 targetBps, uint16 horizonDays, string memory text)
@@ -220,7 +229,7 @@ abstract contract Fixture is Test {
         returns (T.NoteParams memory p)
     {
         p.x = address(token);
-        p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(poolId), address(imd), margIs0);
+        p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(poolId), address(0), false); // derived by the router
         p.side = side;
         p.targetBps = targetBps;
         p.horizonDays = horizonDays;
@@ -230,7 +239,7 @@ abstract contract Fixture is Test {
 
     function _note(address who, T.NoteParams memory p, uint256 imdIn) internal returns (bytes32 id, uint256 received) {
         vm.prank(who);
-        received = router.note(p, imdIn, 1, block.timestamp + 1);
+        received = router.note(p, key, imdIn, 1, block.timestamp + 1);
         id = bytes32(hook.noteCount());
     }
 
@@ -240,6 +249,10 @@ abstract contract Fixture is Test {
 
     function _sell(address who, uint256 margIn) internal returns (uint256 received) {
         received = plain.swap(key, margIs0, margIn, who); // MARG in
+    }
+
+    function _rec(address who) internal view returns (MarginaliaHook.Record memory r) {
+        (r.score, r.posted, r.right, r.wrong, r.broken, r.retracted, r.judgedWins) = hook.records(who);
     }
 
     function _claims(address holder, address currency) internal view returns (uint256) {
