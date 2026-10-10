@@ -56,8 +56,10 @@ async function refresh() {
 
 $('connect').onclick = async () => {
   if (!window.ethereum) return alert('No injected wallet found. Install MetaMask or Rabby.');
-  wallet = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) });
-  [account] = await wallet.requestAddresses();
+  const probe = createWalletClient({ chain: mainnet, transport: custom(window.ethereum) });
+  [account] = await probe.requestAddresses();
+  // The x402 scheme signs through this client without naming an account, so the client must carry it.
+  wallet = createWalletClient({ account, chain: mainnet, transport: custom(window.ethereum) });
   await refresh();
 };
 $('refresh').onclick = refresh;
